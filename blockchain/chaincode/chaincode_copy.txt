@@ -1,0 +1,223 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
+)
+
+// ServerRingManager 是管理服务器节点环的智能合约
+type ServerRingManager struct {
+	contractapi.Contract
+}
+
+// serverNodeListKey 是一个固定的键，用于在世界状态中存储服务器节点列表
+const serverNodeListKey = "server_node_list_key"
+
+// ServerNode 代表哈希环中的一个服务器节点及其状态
+type ServerNode struct {
+	ServerName     string `json:"serverName"`
+	MerkleRootHash string `json:"merkleRootHash"`
+}
+
+// InitLedger 初始化账本，创建一个空的服务器节点列表
+func (s *ServerRingManager) InitLedger(ctx contractapi.TransactionContextInterface) error {
+	log.Println("Initializing the ledger with an empty server node list.")
+
+	nodes := []ServerNode{}
+	nodesJSON, err := json.Marshal(nodes)
+	if err != nil {
+		return fmt.Errorf("failed to marshal empty node list: %w", err)
+	}
+
+	return ctx.GetStub().PutState(serverNodeListKey, nodesJSON)
+}
+
+// AddServerNode 添加一个新的服务器节点到列表中
+func (s *ServerRingManager) AddServerNode(ctx contractapi.TransactionContextInterface, serverName string, merkleRootHash string) error {
+	log.Printf("Attempting to add server node: %s", serverName)
+
+	nodesJSON, err := ctx.GetStub().GetState(serverNodeListKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if nodesJSON == nil {
+		return fmt.Errorf("node list not found. Please initialize the ledger first")
+	}
+
+	var nodes []ServerNode
+	if err := json.Unmarshal(nodesJSON, &nodes); err != nil {
+		return fmt.Errorf("failed to unmarshal node list: %w", err)
+	}
+
+	// 检查服务器名称是否已存在
+	for _, node := range nodes {
+		if node.ServerName == serverName {
+			return fmt.Errorf("server node '%s' already exists", serverName)
+		}
+	}
+
+	newNode := ServerNode{
+		ServerName:     serverName,
+		MerkleRootHash: merkleRootHash,
+	}
+	nodes = append(nodes, newNode)
+
+	updatedNodesJSON, err := json.Marshal(nodes)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated node list: %w", err)
+	}
+
+	if err := ctx.GetStub().PutState(serverNodeListKey, updatedNodesJSON); err != nil {
+		return err
+	}
+	
+	// 为了方便客户端应用，事件的Payload可以包含更丰富的JSON信息
+	eventPayload, _ := json.Marshal(newNode)
+	if err := ctx.GetStub().SetEvent("AddServerNodeEvent", eventPayload); err != nil {
+		return fmt.Errorf("failed to set event: %w", err)
+	}
+
+	log.Printf("Server node %s added successfully.", serverName)
+	return nil
+}
+
+// RemoveServerNode 根据服务器名称从列表中移除一个节点
+func (s *ServerRingManager) RemoveServerNode(ctx contractapi.TransactionContextInterface, serverName string) error {
+	log.Printf("Attempting to remove server node: %s", serverName)
+
+	nodesJSON, err := ctx.GetStub().GetState(serverNodeListKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if nodesJSON == nil {
+		return fmt.Errorf("node list is empty, cannot remove '%s'", serverName)
+	}
+
+	var nodes []ServerNode
+	if err := json.Unmarshal(nodesJSON, &nodes); err != nil {
+		return fmt.Errorf("failed to unmarshal node list: %w", err)
+	}
+
+	found := false
+	var removedNode ServerNode
+	for i, node := range nodes {
+		if node.ServerName == serverName {
+			removedNode = node
+			nodes = append(nodes[:i], nodes[i+1:]...)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("server node '%s' not found", serverName)
+	}
+
+	updatedNodesJSON, err := json.Marshal(nodes)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated node list: %w", err)
+	}
+	
+	if err := ctx.GetStub().PutState(serverNodeListKey, updatedNodesJSON); err != nil {
+		return err
+	}
+	
+	eventPayload, _ := json.Marshal(removedNode)
+	if err := ctx.GetStub().SetEvent("RemoveServerNodeEvent", eventPayload); err != nil {
+		return fmt.Errorf("failed to set event: %w", err)
+	}
+
+	log.Printf("Server node %s removed successfully.", serverName)
+	return nil
+}
+
+// UpdateMerkleRoot 更新指定服务器节点的默克尔树根哈希
+func (s *ServerRingManager) UpdateMerkleRoot(ctx contractapi.TransactionContextInterface, serverName string, newMerkleRootHash string) error {
+	log.Printf("Attempting to update merkle root for server: %s", serverName)
+
+	nodesJSON, err := ctx.GetStub().GetState(serverNodeListKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if nodesJSON == nil {
+		return fmt.Errorf("node list is empty, cannot update '%s'", serverName)
+	}
+
+	var nodes []ServerNode
+	if err := json.Unmarshal(nodesJSON, &nodes); err != nil {
+		return fmt.Errorf("failed to unmarshal node list: %w", err)
+	}
+
+	found := false
+	var updatedNode ServerNode
+	for i := range nodes {
+		if nodes[i].ServerName == serverName {
+			nodes[i].MerkleRootHash = newMerkleRootHash
+			updatedNode = nodes[i]
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("server node '%s' not found", serverName)
+	}
+
+	updatedNodesJSON, err := json.Marshal(nodes)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated node list: %w", err)
+	}
+
+	if err := ctx.GetStub().PutState(serverNodeListKey, updatedNodesJSON); err != nil {
+		return err
+	}
+	
+	eventPayload, _ := json.Marshal(updatedNode)
+	if err := ctx.GetStub().SetEvent("UpdateMerkleRootEvent", eventPayload); err != nil {
+		return fmt.Errorf("failed to set event: %w", err)
+	}
+
+	log.Printf("Merkle root for server %s updated successfully.", serverName)
+	return nil
+}
+
+// GetServerNodes 查询并返回当前所有的服务器节点
+func (s *ServerRingManager) GetServerNodes(ctx contractapi.TransactionContextInterface) ([]*ServerNode, error) {
+	log.Println("Querying for all server nodes.")
+
+	nodesJSON, err := ctx.GetStub().GetState(serverNodeListKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if nodesJSON == nil {
+		log.Println("No server nodes found, returning empty list.")
+		return []*ServerNode{}, nil
+	}
+
+	var nodes []ServerNode
+	if err := json.Unmarshal(nodesJSON, &nodes); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal node list: %w", err)
+	}
+
+	// 将 []ServerNode 转换为 []*ServerNode 以符合 fabric-contract-api 的返回类型要求
+	var result []*ServerNode
+	for i := range nodes {
+		result = append(result, &nodes[i])
+	}
+
+	return result, nil
+}
+
+func main() {
+	chaincode, err := contractapi.NewChaincode(&ServerRingManager{})
+	if err != nil {
+		log.Panicf("Error creating server ring manager chaincode: %v", err)
+	}
+
+	if err := chaincode.Start(); err != nil {
+		log.Panicf("Error starting server ring manager chaincode: %v", err)
+	}
+}

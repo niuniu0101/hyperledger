@@ -1,0 +1,241 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
+)
+
+// MultiRingManager 是管理多个一致性哈希环的智能合约
+type MultiRingManager struct {
+	contractapi.Contract
+}
+
+// allRingsKey 是一个固定的键，用于在世界状态中存储所有环的数据
+const allRingsKey = "all_rings_data_key"
+
+// ServerNode 代表一个服务器节点及其状态
+type ServerNode struct {
+	ServerName     string `json:"serverName"`
+	MerkleRootHash string `json:"merkleRootHash"`
+}
+
+// AllRingsContainer 是存储在世界状态中的顶层结构
+type AllRingsContainer struct {
+	Rings map[string][]ServerNode `json:"rings"`
+}
+
+// InitLedger 初始化账本，创建一个包含两个空环的初始结构
+func (s *MultiRingManager) InitLedger(ctx contractapi.TransactionContextInterface) error {
+	log.Println("Initializing the ledger with two empty rings (ring1, ring2).")
+
+	// 创建初始的复合结构
+	initialData := AllRingsContainer{
+		Rings: map[string][]ServerNode{
+			"ring1": {},
+			"ring2": {},
+		},
+	}
+
+	initialDataJSON, err := json.Marshal(initialData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal initial rings data: %w", err)
+	}
+
+	return ctx.GetStub().PutState(allRingsKey, initialDataJSON)
+}
+
+// InitLedger 初始化账本，创建包含预设服务器节点的初始结构
+// func (s *MultiRingManager) InitLedger(ctx contractapi.TransactionContextInterface) error {
+// 	log.Println("Initializing the ledger with a predefined set of server nodes in two rings.")
+
+// 	// 创建初始的复合结构，并直接填入预设的节点信息
+// 	initialData := AllRingsContainer{
+// 		Rings: map[string][]ServerNode{
+// 			// ring1 中预设两个节点
+// 			"ring1": {
+// 				{ServerName: "init-server-A", MerkleRootHash: "init-hash-a1"},
+// 				{ServerName: "init-server-B", MerkleRootHash: "init-hash-b2"},
+// 			},
+// 			// ring2 中预设一个节点
+// 			"ring2": {
+// 				{ServerName: "init-server-C", MerkleRootHash: "init-hash-c3"},
+// 			},
+// 		},
+// 	}
+
+// 	initialDataJSON, err := json.Marshal(initialData)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to marshal initial rings data: %w", err)
+// 	}
+
+// 	return ctx.GetStub().PutState(allRingsKey, initialDataJSON)
+// }
+
+// AddServerNode 添加一个新的服务器节点到指定的环中
+func (s *MultiRingManager) AddServerNode(ctx contractapi.TransactionContextInterface, ringID string, serverName string, merkleRootHash string) error {
+	log.Printf("Attempting to add server node '%s' to ring '%s'", serverName, ringID)
+
+	// 1. 读取整个复合对象
+	allRingsJSON, err := ctx.GetStub().GetState(allRingsKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if allRingsJSON == nil {
+		return fmt.Errorf("rings data not found. Please initialize the ledger first")
+	}
+
+	var container AllRingsContainer
+	if err := json.Unmarshal(allRingsJSON, &container); err != nil {
+		return fmt.Errorf("failed to unmarshal rings container: %w", err)
+	}
+
+	// 2. 在内存中修改
+	targetRing, ok := container.Rings[ringID]
+	if !ok {
+		return fmt.Errorf("ring '%s' does not exist", ringID)
+	}
+
+	for _, node := range targetRing {
+		if node.ServerName == serverName {
+			return fmt.Errorf("server node '%s' already exists in ring '%s'", serverName, ringID)
+		}
+	}
+
+	newNode := ServerNode{
+		ServerName:     serverName,
+		MerkleRootHash: merkleRootHash,
+	}
+	container.Rings[ringID] = append(targetRing, newNode)
+
+	// 3. 将修改后的整个对象写回
+	updatedRingsJSON, err := json.Marshal(container)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated rings container: %w", err)
+	}
+
+	return ctx.GetStub().PutState(allRingsKey, updatedRingsJSON)
+}
+
+// RemoveServerNode 从指定的环中移除一个服务器节点
+func (s *MultiRingManager) RemoveServerNode(ctx contractapi.TransactionContextInterface, ringID string, serverName string) error {
+	log.Printf("Attempting to remove server node '%s' from ring '%s'", serverName, ringID)
+
+	allRingsJSON, err := ctx.GetStub().GetState(allRingsKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if allRingsJSON == nil {
+		return fmt.Errorf("rings data not found")
+	}
+
+	var container AllRingsContainer
+	if err := json.Unmarshal(allRingsJSON, &container); err != nil {
+		return fmt.Errorf("failed to unmarshal rings container: %w", err)
+	}
+
+	targetRing, ok := container.Rings[ringID]
+	if !ok {
+		return fmt.Errorf("ring '%s' does not exist", ringID)
+	}
+
+	found := false
+	for i, node := range targetRing {
+		if node.ServerName == serverName {
+			container.Rings[ringID] = append(targetRing[:i], targetRing[i+1:]...)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("server node '%s' not found in ring '%s'", serverName, ringID)
+	}
+
+	updatedRingsJSON, err := json.Marshal(container)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated rings container: %w", err)
+	}
+
+	return ctx.GetStub().PutState(allRingsKey, updatedRingsJSON)
+}
+
+// UpdateMerkleRoot 更新指定环中某个服务器节点的默克尔树根哈希
+func (s *MultiRingManager) UpdateMerkleRoot(ctx contractapi.TransactionContextInterface, ringID string, serverName string, newMerkleRootHash string) error {
+	log.Printf("Attempting to update merkle root for server '%s' in ring '%s'", serverName, ringID)
+
+	allRingsJSON, err := ctx.GetStub().GetState(allRingsKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if allRingsJSON == nil {
+		return fmt.Errorf("rings data not found")
+	}
+
+	var container AllRingsContainer
+	if err := json.Unmarshal(allRingsJSON, &container); err != nil {
+		return fmt.Errorf("failed to unmarshal rings container: %w", err)
+	}
+
+	targetRing, ok := container.Rings[ringID]
+	if !ok {
+		return fmt.Errorf("ring '%s' does not exist", ringID)
+	}
+
+	found := false
+	for i := range targetRing {
+		if targetRing[i].ServerName == serverName {
+			targetRing[i].MerkleRootHash = newMerkleRootHash
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("server node '%s' not found in ring '%s'", serverName, ringID)
+	}
+
+	// 更新map中的切片
+	container.Rings[ringID] = targetRing
+
+	updatedRingsJSON, err := json.Marshal(container)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated rings container: %w", err)
+	}
+
+	return ctx.GetStub().PutState(allRingsKey, updatedRingsJSON)
+}
+
+// GetAllRingsData 查询并返回所有环及其节点信息
+func (s *MultiRingManager) GetAllRingsData(ctx contractapi.TransactionContextInterface) (*AllRingsContainer, error) {
+	log.Println("Querying for all rings data.")
+
+	allRingsJSON, err := ctx.GetStub().GetState(allRingsKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if allRingsJSON == nil {
+		log.Println("No rings data found, returning empty structure.")
+		return &AllRingsContainer{Rings: make(map[string][]ServerNode)}, nil
+	}
+
+	var container AllRingsContainer
+	if err := json.Unmarshal(allRingsJSON, &container); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal rings container: %w", err)
+	}
+
+	return &container, nil
+}
+
+func main() {
+	chaincode, err := contractapi.NewChaincode(&MultiRingManager{})
+	if err != nil {
+		log.Panicf("Error creating multi-ring manager chaincode: %v", err)
+	}
+
+	if err := chaincode.Start(); err != nil {
+		log.Panicf("Error starting multi-ring manager chaincode: %v", err)
+	}
+}

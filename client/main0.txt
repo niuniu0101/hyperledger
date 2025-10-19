@@ -1,0 +1,516 @@
+package main
+
+import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"strings"
+
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/hyperledger/client/pkg/fabric"
+	"github.com/hyperledger/client/pkg/models"
+
+	"github.com/hyperledger/client/pkg/network"
+	"github.com/hyperledger/client/pkg/pipeline"
+	"github.com/hyperledger/consistent"
+)
+
+// usepipeline: 1=流水线模式，0=单文件模式
+var usepipeline int
+
+func addNodesToBlockchain(fabricClient *fabric.FabricClient) {
+	for i := 0; i < 40; i++ {
+		serverName := fmt.Sprintf("node%d", i)
+		for {
+			err := fabricClient.AddServerNode(fmt.Sprintf("ring%d", i%4), serverName, "")
+
+			if err != nil {
+				log.Printf("添加节点失败: %s, err: %v", serverName, err)
+				continue
+			}
+			break
+		}
+		fmt.Printf("add %s to ring%d\n", serverName, i%4)
+	}
+	for i := 40; i < 60; i++ {
+		serverName := fmt.Sprintf("node%d", i)
+		for {
+			err := fabricClient.AddServerNode(fmt.Sprintf("ring%d", 4+i%2), serverName, "")
+
+			if err != nil {
+				log.Printf("添加节点失败: %s, err: %v", serverName, err)
+				continue
+			}
+			break
+		}
+		fmt.Printf("add %s to ring%d\n", serverName, i%2+4)
+	}
+}
+
+// 构建本地一致性哈希环，返回 HashRingManager
+func buildLocalHashRing(fabricClient *fabric.FabricClient) (*consistent.HashRingManager, error) {
+	data, err := fabricClient.GetAllRingsData()
+	if err != nil {
+		return nil, fmt.Errorf("获取区块链哈希环失败: %v", err)
+	}
+	var container models.AllRingsContainer
+	if err := json.Unmarshal(data, &container); err != nil {
+		return nil, fmt.Errorf("解析哈希环数据失败: %v", err)
+	}
+	hrm := consistent.NewHashRingManager()
+	hrm.BuildHashRingsFromData(&container)
+	return hrm, nil
+}
+
+// 根据 ringID 和文件名，定位节点
+func locateFileNode(hrm *consistent.HashRingManager, ringID, fileName string) string {
+	return hrm.LocateKey(ringID, fileName)
+}
+
+// 测试客户端 locateFileNode 路由时间
+func testRouteTime(hrm *consistent.HashRingManager, fileNames []string) {
+	start := time.Now()
+	success := 0
+	for _, name := range fileNames {
+		hash := sha256.Sum256([]byte(name))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		ringID := fmt.Sprintf("ring%d", fileHash%4)
+		node := locateFileNode(hrm, ringID, name)
+		if node != "" {
+			success++
+		}
+	}
+	dur := time.Since(start)
+	if success > 0 {
+		avg := dur / time.Duration(success)
+		fmt.Printf("[路由测试] 总数: %d, 成功: %d, 总耗时: %v, 平均耗时: %v\n", len(fileNames), success, dur, avg)
+	} else {
+		fmt.Println("[路由测试] 未能成功路由任何文件名！")
+	}
+}
+
+// displayRingStatus 是一个辅助函数，用于查询并打印当前所有环上的节点状态
+func displayRingStatus(fabricClient *fabric.FabricClient, title string) {
+	fmt.Println("---------------------------------------")
+	fmt.Printf("[状态检查] %s\n", title)
+	hrm, err := buildLocalHashRing(fabricClient)
+	if err != nil {
+		log.Fatalf("构建本地哈希环失败: %v", err)
+	}
+
+	// 遍历所有环并打印其成员
+	for ringID, ring := range hrm.GetAllRings() {
+		members := ring.GetMembers()
+		if len(members) > 0 {
+			fmt.Printf("Ring %s 上的节点: ", ringID)
+			for _, node := range members {
+				fmt.Printf("%s ", node.String())
+			}
+			fmt.Println()
+		} else {
+			fmt.Printf("Ring %s 上的节点: (空)\n", ringID)
+		}
+	}
+	fmt.Println("---------------------------------------")
+}
+
+// 串行模式：逐个上传和查询文件
+func runSerialMode(hrm *consistent.HashRingManager, client *network.TCPClient, files []os.DirEntry) {
+	fmt.Println("=== 使用串行模式 ===")
+
+	// 1. 串行上传文件
+	uploadCount := 0
+	fmt.Println("开始串行上传文件...")
+	for _, file := range files {
+		if uploadCount >= 1000 {
+			break
+		}
+		if file.IsDir() {
+			continue
+		}
+
+		filePath := filepath.Join("files", file.Name())
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("读取文件失败: %s, err: %v", filePath, err)
+			continue
+		}
+
+		// 计算文件哈希和路由
+		hash := sha256.Sum256([]byte(file.Name()))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		fileName := file.Name()
+		if len(fileName) > 16 {
+			fileName = fileName[:16]
+		}
+		ringID := fmt.Sprintf("ring%d", fileHash%4)
+		nodeName := locateFileNode(hrm, ringID, fileName)
+
+		if nodeName == "" {
+			log.Printf("未找到文件 %s 的归属节点，跳过", fileName)
+			continue
+		}
+
+		// 串行上传每个文件
+		err = client.UploadFile(nodeName, fileName, fileHash, data)
+		if err != nil {
+			log.Printf("串行上传失败: %s, err: %v", fileName, err)
+		} else {
+			log.Printf("串行上传成功: %s to %s", fileName, nodeName)
+		}
+		uploadCount++
+	}
+
+	// 2. 串行查询文件
+	// receiveDir := "file_receive"
+	// if err := os.MkdirAll(receiveDir, 0755); err != nil {
+	// 	log.Fatalf("创建接收目录失败: %v", err)
+	// }
+
+	// queryCount := 0
+	// fmt.Println("开始串行查询文件...")
+	// for _, queryFile := range files {
+	// 	if queryCount >= 1000 {
+	// 		break
+	// 	}
+	// 	if queryFile.IsDir() {
+	// 		continue
+	// 	}
+
+	// 	// 计算文件哈希和路由
+	// 	hash := sha256.Sum256([]byte(queryFile.Name()))
+	// 	fileHash := binary.BigEndian.Uint64(hash[:8])
+	// 	fileName := queryFile.Name()
+	// 	if len(fileName) > 16 {
+	// 		fileName = fileName[:16]
+	// 	}
+	// 	ringID := fmt.Sprintf("ring%d", fileHash%4)
+	// 	nodeName := locateFileNode(hrm, ringID, fileName)
+
+	// 	if nodeName == "" {
+	// 		log.Printf("未找到文件 %s 的归属节点，跳过", fileName)
+	// 		continue
+	// 	}
+
+	// 	// 串行查询每个文件
+	// 	result, err := client.QueryFile(nodeName, fileHash)
+	// 	if err != nil {
+	// 		log.Printf("串行查询失败: %s, err: %v", queryFile.Name(), err)
+	// 		continue
+	// 	}
+
+	// 	// 检查返回内容是否为错误信息
+	// 	if len(result) < 8 || (len(result) >= 5 && string(result[:5]) == "ERROR") {
+	// 		log.Printf("服务端返回错误: %s, msg: %s", queryFile.Name(), string(result))
+	// 		continue
+	// 	}
+
+	// 	outPath := filepath.Join(receiveDir, queryFile.Name())
+	// 	if err := os.WriteFile(outPath, result, 0644); err != nil {
+	// 		log.Printf("写入文件失败: %s, err: %v", outPath, err)
+	// 	} else {
+	// 		log.Printf("串行查询并写入成功: %s", outPath)
+	// 	}
+	// 	queryCount++
+	// }
+}
+
+// 流水线模式：使用流水线批量处理上传和查询
+func runPipelineMode(hrm *consistent.HashRingManager, client *network.TCPClient, files []os.DirEntry) {
+	fmt.Println("=== 使用流水线模式 ===")
+
+	hashFunc := func(fileName string) (string, uint64) {
+		hash := sha256.Sum256([]byte(fileName))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		ringID := fmt.Sprintf("ring%d", fileHash%4)
+
+		shortName := fileName
+		if len(shortName) > 16 {
+			shortName = shortName[:16]
+		}
+		return locateFileNode(hrm, ringID, shortName), fileHash
+	}
+
+	uploadPipeline := pipeline.NewClientPipeline(
+		hashFunc,
+		func(node string, tasks []*pipeline.FileTask) {
+			for _, t := range tasks {
+				if node == "" {
+					log.Printf("[流水线] 未找到文件 %s 的归属节点，跳过", t.FileName)
+					continue
+				}
+				shortName := t.FileName
+				if len(shortName) > 16 {
+					shortName = shortName[:16]
+				}
+				if err := client.UploadFile(node, shortName, t.FileHash, t.Data); err != nil {
+					log.Printf("[流水线] 上传失败: %s, err: %v", t.FileName, err)
+				} else {
+					log.Printf("[流水线] 上传成功: %s -> %s (ring%d)", t.FileName, node, t.FileHash%4)
+				}
+			}
+		},
+		20,
+	)
+
+	uploadCount := 0
+	fmt.Println("开始流水线上传文件...")
+	for _, file := range files {
+		if uploadCount >= 1000 || file.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("files", file.Name()))
+		if err != nil {
+			log.Printf("[流水线] 读取文件失败: %s, err: %v", file.Name(), err)
+			continue
+		}
+		uploadPipeline.PushWorkload(file.Name(), data)
+		uploadCount++
+	}
+	uploadPipeline.Wait()
+	fmt.Println("上传流水线已完成!")
+
+	receiveDir := "file_receive"
+	if err := os.MkdirAll(receiveDir, 0755); err != nil {
+		log.Fatalf("创建接收目录失败: %v", err)
+	}
+
+	queryPipeline := pipeline.NewClientPipeline(
+		hashFunc,
+		func(node string, tasks []*pipeline.FileTask) {
+			for _, t := range tasks {
+				if node == "" {
+					log.Printf("[流水线] 未找到文件 %s 的归属节点，跳过", t.FileName)
+					continue
+				}
+				data, err := client.QueryFile(node, t.FileHash)
+				if err != nil {
+					log.Printf("[流水线] 查询失败: %s, err: %v", t.FileName, err)
+					continue
+				}
+				if len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
+					log.Printf("[流水线] 服务端返回错误: %s, msg: %s", t.FileName, string(data))
+					continue
+				}
+				if err := os.WriteFile(filepath.Join(receiveDir, t.FileName), data, 0644); err != nil {
+					log.Printf("[流水线] 写入文件失败: %s, err: %v", t.FileName, err)
+				} else {
+					log.Printf("[流水线] 查询并写入成功: %s (ring%d)", t.FileName, t.FileHash%4)
+				}
+			}
+		},
+		15,
+	)
+
+	queryCount := 0
+	fmt.Println("开始流水线查询文件...")
+	for _, file := range files {
+		if queryCount >= 1000 || file.IsDir() {
+			continue
+		}
+		queryPipeline.PushWorkload(file.Name(), nil)
+		queryCount++
+	}
+	queryPipeline.Wait()
+	fmt.Println("查询流水线已完成!")
+}
+
+func annotateUnifiedData(hrm *consistent.HashRingManager, inputPath, outputPath string) error {
+	inFile, err := os.Open(inputPath)
+	if err != nil {
+		return fmt.Errorf("打开输入文件失败: %w", err)
+	}
+	defer inFile.Close()
+
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("创建输出文件失败: %w", err)
+	}
+	defer outFile.Close()
+
+	scanner := bufio.NewScanner(inFile)
+	writer := bufio.NewWriter(outFile)
+	defer writer.Flush()
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Split(line, "\t")
+		if len(fields) == 0 {
+			continue
+		}
+
+		fileName := fields[0]
+		size := ""
+		if len(fields) > 1 {
+			size = fields[1]
+		}
+
+		hash := sha256.Sum256([]byte(fileName))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		ringID := fmt.Sprintf("ring%d", fileHash%4)
+
+		shortName := fileName
+		if len(shortName) > 16 {
+			shortName = shortName[:16]
+		}
+
+		nodeName := locateFileNode(hrm, ringID, shortName)
+		if nodeName == "" {
+			nodeName = "UNKNOWN"
+		}
+
+		if _, err := fmt.Fprintf(writer, "%-46s\t%-6s\t%s\n", fileName, size, nodeName); err != nil {
+			return fmt.Errorf("写入输出文件失败: %w", err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取输入文件失败: %w", err)
+	}
+
+	return nil
+}
+
+func loadDatasetFileNames(path string, limit int) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	names := make([]string, 0, limit)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) == 0 {
+			continue
+		}
+		names = append(names, fields[0])
+		if limit > 0 && len(names) >= limit {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+func runRouteBenchmark(hrm *consistent.HashRingManager, path string, limit int) {
+	names, err := loadDatasetFileNames(path, limit)
+	if err != nil {
+		log.Fatalf("读取路由数据失败: %v", err)
+	}
+	testRouteTime(hrm, names)
+}
+
+// ...existing code...
+func benchmarkHashRingBuild(fabricClient *fabric.FabricClient, iterations int) {
+	if iterations <= 0 {
+		iterations = 1
+	}
+	var total time.Duration
+	success := 0
+	for i := 0; i < iterations; i++ {
+		start := time.Now()
+		if _, err := buildLocalHashRing(fabricClient); err != nil {
+			log.Printf("[基准] 第 %d 次构建哈希环失败: %v", i+1, err)
+			continue
+		}
+		total += time.Since(start)
+		success++
+	}
+	if success == 0 {
+		log.Println("[基准] 所有构建均失败，无法计算平均值")
+		return
+	}
+	avg := total / time.Duration(success)
+	fmt.Printf("[基准] 成功构建 %d/%d 次，总耗时: %v, 平均耗时: %v\n", success, iterations, total, avg)
+}
+
+// ...existing code...
+func main() {
+	flag.IntVar(&usepipeline, "usepipeline", 0, "1=使用流水线模式, 0=单文件模式, 2=处理统一数据映射, 3=处理前10581条的路由时间")
+	flag.Parse()
+
+	fabricClient, err := fabric.InitFabricClientFromFlags()
+	if err != nil {
+		log.Fatalf("FabricClient 初始化失败: %v", err)
+	}
+	defer fabricClient.Close()
+
+	if err := fabricClient.InitLedger(); err != nil {
+		log.Printf("账本初始化失败（可忽略已初始化错误）: %v", err)
+	}
+
+	// >>> 满足你的要求：在 InitLedger 后立即显示初始状态 <<<
+	displayRingStatus(fabricClient, "账本初始化后的初始状态")
+	// 构建本地一致性哈希环
+	addNodesToBlockchain(fabricClient)
+	hrm, err := buildLocalHashRing(fabricClient)
+	if err != nil {
+		log.Fatalf("构建本地哈希环失败: %v", err)
+	}
+	for ringID, ring := range hrm.GetAllRings() {
+		fmt.Printf("Ring %s 上的节点: ", ringID)
+		for _, node := range ring.GetMembers() {
+			fmt.Printf("%s ", node.String())
+		}
+		fmt.Println()
+	}
+	if usepipeline == 2 {
+		if err := annotateUnifiedData(hrm, "/home/ipfs-dataset/50G_disk/whole_unified_ipfs_data.txt", "/home/ipfs-dataset/50G_disk/whole_unified_ipfs_data_with_node.txt"); err != nil {
+			log.Fatalf("处理统一数据失败: %v", err)
+		}
+		fmt.Println("已生成 unified_ipfs_data_with_node.txt")
+		return
+	}
+	if usepipeline == 3 {
+		runRouteBenchmark(hrm, "/home/ipfs-dataset/50G_disk/whole_unified_ipfs_data.txt", 10851)
+		return
+	}
+	if usepipeline == 4 {
+		benchmarkHashRingBuild(fabricClient, 100)
+		return
+	}
+	storageAddr := "47.237.16.182:8082" // 修改为你的服务端地址
+	//storageAddr := "localhost:8081"
+	dir := "files"
+	client := network.NewTCPClient(storageAddr)
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatalf("读取目录失败: %v", err)
+	}
+
+	// 根据命令行参数选择模式
+	if usepipeline == 1 {
+		runPipelineMode(hrm, client, files)
+	} else {
+		runSerialMode(hrm, client, files)
+	}
+
+	// 生成一万个测试文件名
+	testNames := make([]string, 10000)
+	for i := 0; i < 10000; i++ {
+		testNames[i] = fmt.Sprintf("file_%d.txt", i)
+	}
+	// 调用路由测试
+	testRouteTime(hrm, testNames)
+
+}
