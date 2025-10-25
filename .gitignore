@@ -1,0 +1,32 @@
+# 忽略客户端文件目录
+client/cid_files/
+client/file_receive/
+client/files/
+
+# 忽略其他临时文件和日志
+*.log
+*.txt
+*.out
+client/client
+client/file2node
+client/out
+
+# 忽略其他项目中的类似目录
+client_ipfs/cid_files/
+client_ipfs/file_receive_dht/
+
+# 忽略编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 忽略IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 忽略操作系统文件
+.DS_Store
+Thumbs.db
