@@ -3,6 +3,8 @@ client/cid_files/
 client/file_receive/
 client/files/
 
+storage/server
+
 # 忽略其他临时文件和日志
 *.log
 *.txt

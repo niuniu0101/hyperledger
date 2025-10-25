@@ -13,6 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+	"sync/atomic"
+
 	"github.com/hyperledger/client/pkg/fabric"
 	"github.com/hyperledger/client/pkg/models"
 	"github.com/hyperledger/client/pkg/network"
@@ -67,6 +70,7 @@ var ringToServer = map[int]string{
 环3：47.88.26.4
 */
 var usepipeline int
+var workerCount int
 
 func addNodesToBlockchain(fabricClient *fabric.FabricClient) {
 	for i := 0; i < 40; i++ {
@@ -75,7 +79,7 @@ func addNodesToBlockchain(fabricClient *fabric.FabricClient) {
 		for {
 			err := fabricClient.AddServerNode(ringID, serverName, "")
 			if err != nil {
-				log.Printf("添加节点失败: %s, err: %v", serverName, err)
+				fmt.Println("添加节点失败: %s, err: %v", serverName, err)
 				continue
 			}
 			break
@@ -89,7 +93,7 @@ func addNodesToBlockchain(fabricClient *fabric.FabricClient) {
 				for {
 					err := fabricClient.AddServerNode(ringID, serverName, "")
 					if err != nil {
-						log.Printf("添加节点失败: %s, err: %v", serverName, err)
+						fmt.Println("添加节点失败: %s, err: %v", serverName, err)
 						continue
 					}
 					break
@@ -232,7 +236,7 @@ func closeServerClients(cache map[string]*network.TCPClient) {
 			continue
 		}
 		if err := client.Close(); err != nil {
-			log.Printf("关闭服务器连接失败(%s): %v", addr, err)
+			fmt.Println("关闭服务器连接失败(%s): %v", addr, err)
 		}
 		closed[client] = struct{}{}
 	}
@@ -248,10 +252,10 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 			continue
 		}
 
-		filePath := filepath.Join("./files", file.Name())
+		filePath := filepath.Join("./cid_files", file.Name())
 		data, err := os.ReadFile(filePath)
 		if err != nil {
-			log.Printf("读取文件失败: %s, err: %v", filePath, err)
+			fmt.Println("读取文件失败: %s, err: %v", filePath, err)
 			continue
 		}
 
@@ -269,14 +273,14 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		nodeName := locateFileNode(hrm, ringID, fileName)
 
 		if nodeName == "" {
-			log.Printf("未找到文件 %s 的归属节点，跳过", fileName)
+			fmt.Println("未找到文件 %s 的归属节点，跳过", fileName)
 			continue
 		}
 
 		if err := centerClient.UploadFile(nodeName, fileName, fileHash, data); err != nil {
-			log.Printf("串行上传失败: %s, err: %v", fileName, err)
+			fmt.Println("串行上传失败: %s, err: %v", fileName, err)
 		} else {
-			log.Printf("串行上传成功: %s -> %s (%s)", fileName, nodeName, ringID)
+			fmt.Println("串行上传成功: %s -> %s (%s)", fileName, nodeName, ringID)
 		}
 		uploadCount++
 	}
@@ -293,7 +297,7 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	// 	filePath := filepath.Join("./files", file.Name())
 	// 	data, err := os.ReadFile(filePath)
 	// 	if err != nil {
-	// 		log.Printf("读取文件失败: %s, err: %v", filePath, err)
+	// 		fmt.Println("读取文件失败: %s, err: %v", filePath, err)
 	// 		continue
 	// 	}
 
@@ -308,7 +312,7 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	// 	nodeName := locateFileNode(hrm, ringID, fileName)
 
 	// 	if nodeName == "" {
-	// 		log.Printf("未找到文件 %s 的归属节点，跳过", fileName)
+	// 		fmt.Println("未找到文件 %s 的归属节点，跳过", fileName)
 	// 		continue
 	// 	}
 
@@ -316,31 +320,31 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	// 	ring := int(fileHash % 4)
 	// 	serverAddr, ok := ringToServer[ring]
 	// 	if !ok {
-	// 		log.Printf("环%d没有对应的服务器地址，使用中心服务器: %s", ring, fileName)
+	// 		fmt.Println("环%d没有对应的服务器地址，使用中心服务器: %s", ring, fileName)
 	// 		serverAddr = centerServer
 	// 	}
 
 	// 	// 获取对应服务器的客户端连接
 	// 	targetClient, exists := serverClients[serverAddr]
 	// 	if !exists || targetClient == nil {
-	// 		log.Printf("未找到服务器 %s 的连接，跳过: %s", serverAddr, fileName)
+	// 		fmt.Println("未找到服务器 %s 的连接，跳过: %s", serverAddr, fileName)
 	// 		continue
 	// 	}
 
 	// 	// 直接上传到目标服务器
 	// 	if err := targetClient.UploadFile(nodeName, fileName, fileHash, data); err != nil {
-	// 		log.Printf("直接上传失败: %s -> %s (%s), err: %v", fileName, nodeName, serverAddr, err)
+	// 		fmt.Println("直接上传失败: %s -> %s (%s), err: %v", fileName, nodeName, serverAddr, err)
 
 	// 		// 如果直接上传失败，回退到中心服务器
-	// 		log.Printf("回退到中心服务器上传: %s", fileName)
+	// 		fmt.Println("回退到中心服务器上传: %s", fileName)
 	// 		if err := centerClient.UploadFile(nodeName, fileName, fileHash, data); err != nil {
-	// 			log.Printf("中心服务器上传失败: %s, err: %v", fileName, err)
+	// 			fmt.Println("中心服务器上传失败: %s, err: %v", fileName, err)
 	// 		} else {
-	// 			log.Printf("中心服务器上传成功: %s -> %s", fileName, nodeName)
+	// 			fmt.Println("中心服务器上传成功: %s -> %s", fileName, nodeName)
 	// 			uploadCount++
 	// 		}
 	// 	} else {
-	// 		log.Printf("直接上传成功: %s -> %s (%s)", fileName, nodeName, serverAddr)
+	// 		fmt.Println("直接上传成功: %s -> %s (%s)", fileName, nodeName, serverAddr)
 	// 		uploadCount++
 	// 	}
 	// }
@@ -388,37 +392,37 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	// 	nodeName := locateFileNode(hrm, ringID, fileName)
 
 	// 	if nodeName == "" {
-	// 		log.Printf("未找到文件 %s 的归属节点，跳过", fileName)
+	// 		fmt.Println("未找到文件 %s 的归属节点，跳过", fileName)
 	// 		continue
 	// 	}
 
 	// 	serverAddr, ok := ringToServer[ring]
 	// 	if !ok {
-	// 		log.Printf("ring%d 没有对应的服务器地址，使用中心服务器: %s", ring, file.Name())
+	// 		fmt.Println("ring%d 没有对应的服务器地址，使用中心服务器: %s", ring, file.Name())
 	// 		serverAddr = centerServer
 	// 	}
 	// 	queryClient, exists := serverClients[serverAddr]
 	// 	if !exists || queryClient == nil {
-	// 		log.Printf("未找到服务器 %s 的专属连接，跳过: %s", serverAddr, file.Name())
+	// 		fmt.Println("未找到服务器 %s 的专属连接，跳过: %s", serverAddr, file.Name())
 	// 		continue
 	// 	}
 
 	// 	returnedHash, data, err := queryClient.QueryFile(nodeName, fileHash)
 
 	// 	if err != nil || len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
-	// 		log.Printf("%d", data)
-	// 		log.Printf("  客户端: %s", queryClient.Conn.RemoteAddr().String())
-	// 		log.Printf("  服务器: %s", queryClient.Conn.LocalAddr().String())
-	// 		log.Printf("从 %s 查询失败，回退到中心服务器: %s", serverAddr, file.Name())
+	// 		fmt.Println("%d", data)
+	// 		fmt.Println("  客户端: %s", queryClient.Conn.RemoteAddr().String())
+	// 		fmt.Println("  服务器: %s", queryClient.Conn.LocalAddr().String())
+	// 		fmt.Println("从 %s 查询失败，回退到中心服务器: %s", serverAddr, file.Name())
 	// 		returnedHash, data, err = centerClient.QueryFile(nodeName, fileHash)
 	// 		if err != nil {
-	// 			log.Printf("中心服务器查询失败: %s, err: %v", file.Name(), err)
+	// 			fmt.Println("中心服务器查询失败: %s, err: %v", file.Name(), err)
 	// 			continue
 	// 		}
 	// 	}
 
 	// 	if len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
-	// 		log.Printf("服务端返回错误: %s, msg: %s", file.Name(), string(data))
+	// 		fmt.Println("服务端返回错误: %s, msg: %s", file.Name(), string(data))
 	// 		continue
 	// 	}
 
@@ -430,9 +434,9 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 
 	// 	outPath := filepath.Join(receiveDir, outName)
 	// 	if err := os.WriteFile(outPath, data, 0644); err != nil {
-	// 		log.Printf("写入文件失败: %s, err: %v", outPath, err)
+	// 		fmt.Println("写入文件失败: %s, err: %v", outPath, err)
 	// 	} else {
-	// 		log.Printf("串行查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
+	// 		fmt.Println("串行查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
 	// 	}
 	// 	queryCount++
 	// }
@@ -492,7 +496,7 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 
 		if nodeName == "" {
 			logMsg := fmt.Sprintf("未找到文件 %s 的归属节点，跳过", fileName)
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("FAIL: %s", logMsg)
 			failCount++
 			continue
@@ -501,14 +505,14 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		serverAddr, ok := ringToServer[ring]
 		if !ok {
 			logMsg := fmt.Sprintf("ring%d 没有对应的服务器地址，使用中心服务器: %s", ring, file.Name())
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("WARN: %s", logMsg)
 			serverAddr = centerServer
 		}
 		queryClient, exists := serverClients[serverAddr]
 		if !exists || queryClient == nil {
 			logMsg := fmt.Sprintf("未找到服务器 %s 的专属连接，跳过: %s", serverAddr, file.Name())
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("FAIL: %s", logMsg)
 			failCount++
 			continue
@@ -517,17 +521,17 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		returnedHash, data, err := queryClient.QueryFile(nodeName, fileHash)
 
 		if err != nil || len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
-			log.Printf("%d", data)
-			log.Printf("  客户端: %s", queryClient.Conn.RemoteAddr().String())
-			log.Printf("  服务器: %s", queryClient.Conn.LocalAddr().String())
+			fmt.Println("%d", data)
+			fmt.Println("  客户端: %s", queryClient.Conn.RemoteAddr().String())
+			fmt.Println("  服务器: %s", queryClient.Conn.LocalAddr().String())
 			logMsg := fmt.Sprintf("从 %s 查询失败，回退到中心服务器: %s", serverAddr, file.Name())
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("FAIL: %s", logMsg)
 
 			returnedHash, data, err = centerClient.QueryFile(nodeName, fileHash)
 			if err != nil {
 				logMsg := fmt.Sprintf("中心服务器查询失败: %s, err: %v", file.Name(), err)
-				log.Printf(logMsg)
+				fmt.Println(logMsg)
 				logger.Printf("FAIL: %s", logMsg)
 				failCount++
 				continue
@@ -536,7 +540,7 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 
 		if len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
 			logMsg := fmt.Sprintf("服务端返回错误: %s, msg: %s", file.Name(), string(data))
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("FAIL: %s", logMsg)
 			failCount++
 			continue
@@ -551,12 +555,12 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		outPath := filepath.Join(receiveDir, outName)
 		if err := os.WriteFile(outPath, data, 0644); err != nil {
 			logMsg := fmt.Sprintf("写入文件失败: %s, err: %v", outPath, err)
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("FAIL: %s", logMsg)
 			failCount++
 		} else {
 			logMsg := fmt.Sprintf("串行查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
-			log.Printf(logMsg)
+			fmt.Println(logMsg)
 			logger.Printf("SUCCESS: %s", logMsg)
 			successCount++
 		}
@@ -572,6 +576,7 @@ func runSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 
 func runPipelineMode(hrm *consistent.HashRingManager, centerClient *network.TCPClient, serverClients map[string]*network.TCPClient, files []os.DirEntry) {
 	fmt.Println("=== 使用流水线模式 ===")
+	fmt.Printf("每个存储服务器连接使用 %d 个worker goroutine处理响应\n", workerCount)
 
 	// // 构造本地的 fileHash -> 原始文件名 映射
 	hashToName := make(map[uint64]string, len(files))
@@ -602,15 +607,237 @@ func runPipelineMode(hrm *consistent.HashRingManager, centerClient *network.TCPC
 		log.Fatalf("创建接收目录失败: %v", err)
 	}
 
+	// 建立异步会话与结果收集
+	sessions := make(map[string]*network.AsyncQuerySession)
+	var expectedCount int64
+	var receivedCount int64
+	var recvWG sync.WaitGroup
+
+	// 全局查询状态表：0-pending, 1-success, 2-failed
+	const (
+		statePending = int32(0)
+		stateSuccess = int32(1)
+		stateFailed  = int32(2)
+	)
+	var queryState sync.Map // map[uint64]int32
+
+	setPendingIfAbsent := func(h uint64) bool {
+		if _, loaded := queryState.Load(h); !loaded {
+			queryState.Store(h, statePending)
+			return true
+		}
+		return false
+	}
+	transitionFromPending := func(h uint64, to int32) bool {
+		if v, ok := queryState.Load(h); ok {
+			if vv, ok2 := v.(int32); ok2 && vv == statePending {
+				queryState.Store(h, to)
+				return true
+			}
+			// 如果已经是success或failed，说明已经处理过了，不应该再次计数
+			return false
+		}
+		// 未存在则不算一次有效完成
+		return false
+	}
+
+	// 新增：确保文件被计数的函数
+	ensureCounted := func(h uint64, to int32) bool {
+		if v, ok := queryState.Load(h); ok {
+			if vv, ok2 := v.(int32); ok2 {
+				// 如果已经是目标状态，说明已经计数过了
+				if vv == to {
+					return false
+				}
+				// 更新状态
+				queryState.Store(h, to)
+				return true
+			}
+		}
+		// 如果不存在，创建并计数
+		queryState.Store(h, to)
+		return true
+	}
+	// 回退任务通道与回退线程
+	type fallbackTask struct {
+		NodeName string
+		FileHash uint64
+	}
+	fallbackCh := make(chan fallbackTask, 4096)
+	doneCh := make(chan struct{}) // 用于优雅关闭
+
+	// 中心服务器状态监控
+	var centerServerPending int64
+	var centerServerProcessed int64
+	recvWG.Add(1)
+	go func() {
+		defer recvWG.Done()
+		for {
+			select {
+			case t, ok := <-fallbackCh:
+				if !ok {
+					return
+				}
+				// 优先把回退请求发到中心服务器的异步会话发送队列（如果存在）
+				if sess, ok := sessions[centerServer]; ok && sess != nil {
+					fmt.Println("[回退ing] to %v", centerServer)
+					// 尝试非阻塞入队，若失败则异步入队保证最终发送
+					if !sess.TryEnqueue(t.NodeName, t.FileHash) {
+						go sess.Enqueue(t.NodeName, t.FileHash)
+					}
+					// 交由中心会话的结果处理器计数/写文件
+					continue
+				}
+				/*
+					// 检查是否已经处理过
+					if actual, loaded := queryState.Load(t.FileHash); loaded && (actual == stateSuccess || actual == stateFailed) {
+						// 已经处理过，但仍然计入中心服务器处理数
+						atomic.AddInt64(&centerServerProcessed, 1)
+						continue
+					}
+
+					atomic.AddInt64(&centerServerPending, 1)
+					fmt.Println("[回退] 中心服务器查询开始 node=%s hash=%d (待处理:%d)", t.NodeName, t.FileHash, atomic.LoadInt64(&centerServerPending))
+					retHash, data, err := centerClient.QueryFile(t.NodeName, t.FileHash)
+					atomic.AddInt64(&centerServerPending, -1)
+					atomic.AddInt64(&centerServerProcessed, 1)
+
+					if err != nil || (len(data) >= 5 && string(data[:5]) == "ERROR") {
+						if err != nil {
+							fmt.Println("[回退-失败] node=%s hash=%d err=%v (已处理:%d)", t.NodeName, t.FileHash, err, atomic.LoadInt64(&centerServerProcessed))
+						} else {
+							fmt.Println("[回退-失败] node=%s hash=%d msg=%q (已处理:%d)", t.NodeName, t.FileHash, string(data), atomic.LoadInt64(&centerServerProcessed))
+						}
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+						continue
+					}
+					if len(data) == 0 {
+						// 中心也未命中：将状态置为失败（若仍为pending），并结束
+						fmt.Println("[回退-未命中] node=%s hash=%d (已处理:%d)", t.NodeName, t.FileHash, atomic.LoadInt64(&centerServerProcessed))
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+						continue
+					}
+					outName, ok := hashToName[retHash]
+					if !ok {
+						fmt.Println("[回退-警告] 未找到文件名映射 hash=%d (已处理:%d)", retHash, atomic.LoadInt64(&centerServerProcessed))
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+						continue
+					}
+					filePath := filepath.Join(receiveDir, outName)
+					if err := os.WriteFile(filePath, data, 0644); err != nil {
+						fmt.Println("[回退-写入失败] 文件=%s hash=%d err=%v (已处理:%d)", outName, retHash, err, atomic.LoadInt64(&centerServerProcessed))
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+						continue
+					}
+					if ensureCounted(t.FileHash, stateSuccess) {
+						atomic.AddInt64(&receivedCount, 1)
+					}
+					fmt.Println("[回退-成功] 写入文件 %s (hash=%d) (已处理:%d)", outName, retHash, atomic.LoadInt64(&centerServerProcessed))
+				*/
+			case <-doneCh:
+				return
+			}
+		}
+	}()
+	for ring := 0; ring <= 3; ring++ {
+		addr, ok := ringToServer[ring]
+		if !ok {
+			continue
+		}
+		cli := serverClients[addr]
+		if cli == nil {
+			continue
+		}
+		// 使用多worker模式启动异步会话
+		sess, err := cli.StartAsyncQueryWithWorkers(1024, workerCount)
+		if err != nil {
+			fmt.Println("启动异步会话失败 %s: %v", addr, err)
+			continue
+		}
+		sessions[addr] = sess
+		// 设置每台服务器的最大并发请求上限，避免长队导致超时
+		sess.SetInFlightLimit(2048)
+		recvWG.Add(1)
+		go func(s *network.AsyncQuerySession, ringID int, serverAddr string) {
+			defer recvWG.Done()
+			for res := range s.Results() {
+				if res.Err == nil && len(res.Data) > 0 {
+					// 成功
+					if outName, ok := hashToName[res.ReturnedHash]; ok {
+						filePath := filepath.Join(receiveDir, outName)
+						if err := os.WriteFile(filePath, res.Data, 0644); err != nil {
+							fmt.Println("[写入失败] ring=%d server=%s node=%s hash=%d 文件=%s err=%v", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName, err)
+							if transitionFromPending(res.RequestHash, stateFailed) {
+								atomic.AddInt64(&receivedCount, 1)
+							}
+							// 写入失败也要回退
+							select {
+							case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:
+							case <-doneCh:
+								// 已关闭，跳过
+							default:
+								fmt.Println("[警告] 写入失败回退通道已满，跳过回退 node=%s hash=%d", res.NodeName, res.RequestHash)
+							}
+							continue
+						}
+						if ensureCounted(res.RequestHash, stateSuccess) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+						fmt.Println("[成功] ring=%d server=%s node=%s hash=%d 文件=%s", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName)
+						continue
+					}
+				}
+				// 未命中/失败：标记失败并回退（仅第一次从pending转失败时计入完成）
+				if ensureCounted(res.RequestHash, stateFailed) {
+					atomic.AddInt64(&receivedCount, 1)
+				}
+				if res.Err != nil {
+					fmt.Println("[失败] ring=%d server=%s node=%s hash=%d err=%v -> 回退中心", ringID, serverAddr, res.NodeName, res.RequestHash, res.Err)
+				} else if len(res.Data) == 0 {
+					fmt.Println("[失败] ring=%d server=%s node=%s hash=%d 未命中 -> 回退中心", ringID, serverAddr, res.NodeName, res.RequestHash)
+				} else {
+					fmt.Println("[失败] ring=%d server=%s node=%s hash=%d 未匹配文件名 -> 回退中心", ringID, serverAddr, res.NodeName, res.RequestHash)
+				}
+				select {
+				case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:
+					// 成功发送
+				case <-doneCh:
+					// 已关闭，跳过
+				default:
+					// 通道已满，记录日志但不panic
+					fmt.Println("[警告] 回退通道已满，跳过回退 node=%s hash=%d", res.NodeName, res.RequestHash)
+				}
+			}
+		}(sess, ring, addr)
+	}
+
 	queryPipeline := pipeline.NewClientPipeline(
 		hashFunc,
 		func(node string, tasks []*pipeline.FileTask) {
+			// 如果无法定位节点，则将这些任务直接标记为失败，并计入期望与已接收
+			if node == "" {
+				for _, t := range tasks {
+					if set := setPendingIfAbsent(t.FileHash); set {
+						atomic.AddInt64(&expectedCount, 1)
+					}
+					if ensureCounted(t.FileHash, stateFailed) {
+						atomic.AddInt64(&receivedCount, 1)
+					}
+					fmt.Println("[流水线] 未找到文件 %s 的归属节点，标记为失败", t.FileName)
+				}
+				return
+			}
+
 			ringGroups := make(map[int][]*pipeline.FileTask)
 			for _, t := range tasks {
-				if node == "" {
-					log.Printf("[流水线] 未找到文件 %s 的归属节点，跳过", t.FileName)
-					continue
-				}
 				ring := int(t.FileHash % 4)
 				ringGroups[ring] = append(ringGroups[ring], t)
 			}
@@ -621,116 +848,48 @@ func runPipelineMode(hrm *consistent.HashRingManager, centerClient *network.TCPC
 				}
 				serverAddr, ok := ringToServer[ring]
 				if !ok {
-					log.Printf("[流水线] ring%d 没有对应的服务器地址，跳过该组", ring)
+					fmt.Println("[流水线] ring%d 没有对应的服务器地址，跳过该组", ring)
+					// 这些任务也应被计入期望并标记失败以避免阻塞
+					for _, t := range group {
+						if set := setPendingIfAbsent(t.FileHash); set {
+							atomic.AddInt64(&expectedCount, 1)
+						}
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+					}
 					continue
 				}
-				queryClient, exists := serverClients[serverAddr]
-				if !exists || queryClient == nil {
-					log.Printf("[流水线] 未找到服务器 %s 的专属连接，跳过该组", serverAddr)
+				sess, ok := sessions[serverAddr]
+				if !ok || sess == nil {
+					fmt.Println("[流水线] 未找到服务器 %s 的异步会话，跳过该组", serverAddr)
+					// 同样计入期望并标记失败
+					for _, t := range group {
+						if set := setPendingIfAbsent(t.FileHash); set {
+							atomic.AddInt64(&expectedCount, 1)
+						}
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+					}
 					continue
 				}
-
-				batch := make([]struct {
-					NodeName string
-					FileHash uint64
-				}, len(group))
-				for i, t := range group {
-					batch[i].NodeName = t.Node
-					batch[i].FileHash = t.FileHash
-				}
-
-				hashes, results, errs := queryClient.BatchQueryFiles(batch)
-				/*for i, t := range group {
-					if errs[i] != nil {
-						log.Printf("[流水线] 查询失败: %s, err: %v", t.FileName, errs[i])
-						retHash, data, err := centerClient.QueryFile(t.Node, t.FileHash)
-						if err != nil {
-							log.Printf("[流水线] 中心服务器查询失败: %s, err: %v", t.FileName, err)
-							continue
-						}
-						if len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
-							log.Printf("[流水线] 服务端返回错误: %s, msg: %s", t.FileName, string(data))
-							continue
-						}
-						outName, ok := hashToName[retHash]
-						if !ok {
-							outName = t.FileName
-						}
-						if err := os.WriteFile(filepath.Join(receiveDir, outName), data, 0644); err != nil {
-							log.Printf("[流水线] 写入文件失败: %s, err: %v", outName, err)
-						} else {
-							log.Printf("[流水线] 查询并写入成功(回退): %s (ring%d, server: %s)", outName, ring, centerServer)
+				for _, t := range group {
+					if set := setPendingIfAbsent(t.FileHash); set {
+						atomic.AddInt64(&expectedCount, 1)
+					}
+					if !sess.TryEnqueue(t.Node, t.FileHash) {
+						// 非阻塞投递失败（sendCh 满或 in-flight 限流），直接回退中心
+						inF, p, qLen, lim := sess.Metrics()
+						fmt.Println("[投递-回退] server=%s node=%s hash=%d 原因=sendCh满/限流 inFlight=%d pending=%d q=%d limit=%d", serverAddr, t.Node, t.FileHash, inF, p, qLen, lim)
+						// 投递失败时，回退中心处理（完成状态将在回退线程中计数）
+						select {
+						case fallbackCh <- fallbackTask{NodeName: t.Node, FileHash: t.FileHash}:
+						case <-doneCh:
+						default:
+							fmt.Println("[警告] 回退通道已满，跳过回退 node=%s hash=%d", t.Node, t.FileHash)
 						}
 						continue
-					}
-					retHash := hashes[i]
-					data := results[i]
-					if len(data) < 8 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
-						log.Printf("[流水线] 服务端返回错误: %s, msg: %s", t.FileName, string(data))
-						continue
-					}
-					outName, ok := hashToName[retHash]
-					if !ok {
-						outName = t.FileName
-					}
-					if err := os.WriteFile(filepath.Join(receiveDir, outName), data, 0644); err != nil {
-						log.Printf("[流水线] 写入文件失败: %s, err: %v", outName, err)
-					} else {
-						log.Printf("[流水线] 查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
-					}
-				}*/
-				// 先处理目标服务器返回，收集需要回退到中心服务器的项
-				var fallbackBatch []struct {
-					NodeName string
-					FileHash uint64
-				}
-				var fallbackIdxs []int // 保存原始 group 索引，便于回填结果
-
-				for i, t := range group {
-					// 出错或超出返回长度都视为需要回退
-					if errs[i] != nil {
-						log.Printf("[流水线] 目标服务器未返回或出错，回退到中心: %s", t.FileName)
-						fallbackBatch = append(fallbackBatch, struct {
-							NodeName string
-							FileHash uint64
-						}{NodeName: t.Node, FileHash: t.FileHash})
-						fallbackIdxs = append(fallbackIdxs, i)
-						continue
-					}
-					retHash := hashes[i]
-					data := results[i]
-					outName, ok := hashToName[retHash]
-					if !ok {
-						outName = t.FileName
-					}
-					if err := os.WriteFile(filepath.Join(receiveDir, outName), data, 0644); err != nil {
-						log.Printf("[流水线] 写入文件失败: %s, err: %v", outName, err)
-					} else {
-						log.Printf("[流水线] 查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
-					}
-				}
-
-				// 如果有需要回退的项，批量发送到中心服务器查询
-				if len(fallbackBatch) > 0 {
-					cHashes, cResults, cErrs := centerClient.BatchQueryFiles(fallbackBatch)
-					for j, origIdx := range fallbackIdxs {
-						t := group[origIdx]
-						// 检查中心返回
-						if j < len(cErrs) && cErrs[j] != nil {
-							log.Printf("[流水线] 中心服务器回退查询失败: %s, err: %v", t.FileName, cErrs[j])
-							continue
-						}
-						retHash := cHashes[j]
-						data := cResults[j]
-						outName, ok := hashToName[retHash]
-						if !ok {
-							outName = t.FileName
-						}
-						if err := os.WriteFile(filepath.Join(receiveDir, outName), data, 0644); err != nil {
-							log.Printf("[流水线] 回退写入文件失败: %s, err: %v", outName, err)
-						} else {
-							log.Printf("[流水线] 查询并写入成功(回退): %s (ring%d, server: %s)", outName, ring, centerServer)
-						}
 					}
 				}
 			}
@@ -742,14 +901,194 @@ func runPipelineMode(hrm *consistent.HashRingManager, centerClient *network.TCPC
 	queryCount := 0
 	fmt.Println("开始流水线查询文件...")
 	for _, file := range files {
-		if queryCount >= 5000 || file.IsDir() {
+		if queryCount >= 1000 || file.IsDir() {
 			continue
 		}
 		queryPipeline.PushWorkload(file.Name(), nil)
 		queryCount++
 	}
 	queryPipeline.Wait()
-	fmt.Printf("查询流水线已完成，共查询 %d 个文件!\n", queryCount)
+	// 等全部响应回收，定期打印进度与每台服务器指标
+	progressTicker := time.NewTicker(20 * time.Second)
+	defer progressTicker.Stop()
+
+	// 添加强制超时机制
+	timeoutTimer := time.NewTimer(5 * time.Minute)
+	defer timeoutTimer.Stop()
+
+	lastProgressTime := time.Now()
+	lastReceivedCount := int64(0)
+
+	for {
+		rc := atomic.LoadInt64(&receivedCount)
+		ec := atomic.LoadInt64(&expectedCount)
+
+		// 检查是否真正完成：所有文件都有最终状态
+		allCompleted := true
+		totalFiles := int64(0)
+		completedFiles := int64(0)
+
+		queryState.Range(func(key, value interface{}) bool {
+			totalFiles++
+			if status, ok := value.(int32); ok {
+				if status == stateSuccess || status == stateFailed {
+					completedFiles++
+				} else {
+					allCompleted = false
+				}
+			} else {
+				allCompleted = false
+			}
+			return true
+		})
+
+		if allCompleted && totalFiles > 0 && completedFiles == totalFiles {
+			fmt.Println("[完成] 所有请求已完成: 已接收=%d / 期望=%d (实际文件数=%d)", rc, ec, totalFiles)
+			// 先关闭doneCh，通知所有goroutine停止
+			close(doneCh)
+			// 然后关闭所有会话
+			for _, s := range sessions {
+				if s != nil {
+					s.Close()
+				}
+			}
+			// 最后关闭fallbackCh
+			close(fallbackCh)
+			break
+		}
+
+		select {
+		case <-progressTicker.C:
+			centerPending := atomic.LoadInt64(&centerServerPending)
+			centerProcessed := atomic.LoadInt64(&centerServerProcessed)
+			fmt.Println("[进度] 已接收=%d / 期望=%d | 中心服务器: 待处理=%d 已处理=%d | 实际文件: 总数=%d 已完成=%d", rc, ec, centerPending, centerProcessed, totalFiles, completedFiles)
+
+			// 检查是否有进展
+			if rc > lastReceivedCount {
+				lastProgressTime = time.Now()
+				lastReceivedCount = rc
+			} else if time.Since(lastProgressTime) > 30*time.Second {
+				fmt.Println("[警告] 超过30秒没有进展，当前状态: 已接收=%d / 期望=%d", rc, ec)
+
+				// 详细分析queryState状态
+				pendingCount := 0
+				successCount := 0
+				failedCount := 0
+				unknownCount := 0
+				queryState.Range(func(key, value interface{}) bool {
+					if status, ok := value.(int32); ok {
+						switch status {
+						case statePending:
+							pendingCount++
+						case stateSuccess:
+							successCount++
+						case stateFailed:
+							failedCount++
+						default:
+							unknownCount++
+						}
+					} else {
+						unknownCount++
+					}
+					return true
+				})
+				fmt.Println("[调试] queryState状态: pending=%d success=%d failed=%d unknown=%d", pendingCount, successCount, failedCount, unknownCount)
+				fmt.Println("[调试] 回退通道状态: 长度=%d 容量=%d", len(fallbackCh), cap(fallbackCh))
+
+				lastProgressTime = time.Now() // 重置计时器
+			}
+
+			// 按服务器输出 inFlight/pending/队列
+			for ring := 0; ring <= 3; ring++ {
+				addr, ok := ringToServer[ring]
+				if !ok {
+					continue
+				}
+				if s, ok := sessions[addr]; ok && s != nil {
+					inF, p, qLen, lim := s.Metrics()
+					fmt.Println("[进度-服务器] ring=%d addr=%s inFlight=%d pending=%d q=%d limit=%d", ring, addr, inF, p, qLen, lim)
+				}
+			}
+
+		case <-timeoutTimer.C:
+			fmt.Println("[超时] 5分钟超时，强制结束: 已接收=%d / 期望=%d", rc, ec)
+			goto timeoutExit
+
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+timeoutExit:
+	// 等待所有goroutine完成
+	recvWG.Wait()
+
+	// 统计最终结果
+	finalReceived := atomic.LoadInt64(&receivedCount)
+	finalExpected := atomic.LoadInt64(&expectedCount)
+	centerProcessed := atomic.LoadInt64(&centerServerProcessed)
+
+	// 统计成功和失败的文件数量
+	successCount := int64(0)
+	failedCount := int64(0)
+	queryState.Range(func(key, value interface{}) bool {
+		if status, ok := value.(int32); ok {
+			if status == stateSuccess {
+				successCount++
+			} else if status == stateFailed {
+				failedCount++
+			}
+		}
+		return true
+	})
+
+	fmt.Printf("=== 查询流水线完成统计 ===\n")
+	fmt.Printf("总查询文件数: %d\n", queryCount)
+	fmt.Printf("期望接收数: %d\n", finalExpected)
+	fmt.Printf("实际接收数: %d\n", finalReceived)
+	fmt.Printf("成功文件数: %d\n", successCount)
+	fmt.Printf("失败文件数: %d\n", failedCount)
+	fmt.Printf("中心服务器处理数: %d\n", centerProcessed)
+	fmt.Printf("缺失文件数: %d\n", finalExpected-finalReceived)
+
+	// 统计实际接收目录中的文件数量
+	if actualFiles, err := os.ReadDir(receiveDir); err == nil {
+		fmt.Printf("实际接收目录文件数: %d\n", len(actualFiles))
+
+		// 检查是否有重复文件
+		fileCounts := make(map[string]int)
+		for _, file := range actualFiles {
+			if !file.IsDir() {
+				fileCounts[file.Name()]++
+			}
+		}
+
+		// 统计重复文件
+		duplicateCount := 0
+		for _, count := range fileCounts {
+			if count > 1 {
+				duplicateCount += count - 1
+			}
+		}
+		if duplicateCount > 0 {
+			fmt.Printf("重复文件数: %d\n", duplicateCount)
+		}
+
+		// 统计文件大小
+		totalSize := int64(0)
+		for _, file := range actualFiles {
+			if !file.IsDir() {
+				if info, err := file.Info(); err == nil {
+					totalSize += info.Size()
+				}
+			}
+		}
+		fmt.Printf("接收文件总大小: %d 字节 (%.2f MB)\n", totalSize, float64(totalSize)/(1024*1024))
+
+	} else {
+		fmt.Printf("无法读取接收目录: %v\n", err)
+	}
+	fmt.Printf("========================\n")
 }
 
 func annotateUnifiedData(hrm *consistent.HashRingManager, inputPath, outputPath string) error {
@@ -874,7 +1213,7 @@ func benchmarkHashRingBuild(fabricClient *fabric.FabricClient, iterations int) {
 		elapsed := time.Since(start)
 
 		if err != nil {
-			log.Printf("[基准] 第 %d 次构建哈希环失败: %v", i+1, err)
+			fmt.Println("[基准] 第 %d 次构建哈希环失败: %v", i+1, err)
 			fmt.Fprintf(writer, "%d\t失败\t%d\t%.3f\t%v\n",
 				i+1, elapsed.Nanoseconds(), float64(elapsed.Nanoseconds())/1e6, err)
 			continue
@@ -911,6 +1250,8 @@ func benchmarkHashRingBuild(fabricClient *fabric.FabricClient, iterations int) {
 func main() {
 	flag.IntVar(&usepipeline, "usepipeline", 0,
 		"运行模式: 0=串行模式, 1=流水线模式, 2=处理统一数据映射, 3=路由时间测试, 4=哈希环构建基准测试")
+	flag.IntVar(&workerCount, "workers", 4,
+		"每个存储服务器连接的worker goroutine数量，用于并行处理响应")
 	flag.Parse()
 
 	fabricClient, err := fabric.InitFabricClientFromFlags()
@@ -920,7 +1261,7 @@ func main() {
 	defer fabricClient.Close()
 
 	if err := fabricClient.InitLedger(); err != nil {
-		log.Printf("账本初始化失败（可忽略已初始化错误）: %v", err)
+		fmt.Println("账本初始化失败（可忽略已初始化错误）: %v", err)
 	}
 
 	displayRingStatus(fabricClient, "账本初始化后的初始状态")
@@ -928,7 +1269,7 @@ func main() {
 	// addNodesToBlockchain(fabricClient)
 
 	if err := fabricClient.InitLedgerWithCustomNodes(); err != nil {
-		log.Printf("账本添加节点失败: %v", err)
+		fmt.Println("账本添加节点失败: %v", err)
 	}
 
 	hrm, err := buildLocalHashRing(fabricClient)
@@ -946,7 +1287,7 @@ func main() {
 	}
 	time.Sleep(5 * time.Second)
 
-	dir := "./files"
+	dir := "./cid_files"
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		log.Fatalf("读取目录失败: %v", err)
@@ -989,6 +1330,6 @@ func main() {
 		benchmarkHashRingBuild(fabricClient, 10000)
 
 	default:
-		log.Printf("未知的运行模式: %d", usepipeline)
+		fmt.Println("未知的运行模式: %d", usepipeline)
 	}
 }
