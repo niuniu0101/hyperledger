@@ -1,23 +1,13 @@
 package network
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 )
-
-// WriteByte 写入单字节（与 io.Writer 标准方法兼容）
-func (p *ProtocolHelper) WriteByte(b byte) error {
-	// 这里需要有目标 Writer，建议实际用法时用 bufio.Writer 或 net.Conn.Write
-	return fmt.Errorf("ProtocolHelper.WriteByte 需要指定写入目标")
-}
-
-// ReadByte 读取单字节（与 io.Reader 标准方法兼容）
-func (p *ProtocolHelper) ReadByte() (byte, error) {
-	// 这里需要有目标 Reader，建议实际用法时用 bufio.Reader 或 net.Conn.Read
-	return 0, fmt.Errorf("ProtocolHelper.ReadByte 需要指定读取目标")
-}
 
 // 协议常量
 const (
@@ -42,6 +32,176 @@ type FileResponse struct {
 
 // ProtocolHelper 协议辅助函数
 type ProtocolHelper struct{}
+
+// Frame header: 4 bytes
+// header[0] = magic (0xA5)
+// header[1..3] = payload length (big-endian 3 bytes)
+const (
+	FrameMagic byte = 0xA5
+	Max3Byte   int  = 0xFFFFFF
+)
+
+// WriteFrame 写入一个完整的消息帧（header + payload），处理短写
+func (p *ProtocolHelper) WriteFrame(conn net.Conn, payload []byte) error {
+	if len(payload) > Max3Byte {
+		return fmt.Errorf("payload too large: %d", len(payload))
+	}
+	header := make([]byte, 4)
+	header[0] = FrameMagic
+	header[1] = byte((len(payload) >> 16) & 0xFF)
+	header[2] = byte((len(payload) >> 8) & 0xFF)
+	header[3] = byte(len(payload) & 0xFF)
+
+	// write header
+	if _, err := conn.Write(header); err != nil {
+		return err
+	}
+	// write payload handling short writes
+	total := len(payload)
+	written := 0
+	for written < total {
+		n, err := conn.Write(payload[written:])
+		if err != nil {
+			return err
+		}
+		written += n
+	}
+	return nil
+}
+
+// ReadFrame 读取一个完整帧并返回 payload（会阻塞直到读满或出错）
+func (p *ProtocolHelper) ReadFrame(conn net.Conn, maxAccept int) ([]byte, error) {
+	// Scan until we find the frame magic byte. This allows skipping any
+	// spurious bytes on the stream and resynchronizing to the next frame.
+	// We read one byte at a time until we see FrameMagic, then read the
+	// remaining 3 header bytes to obtain payload length.
+	var one [1]byte
+	for {
+		if _, err := io.ReadFull(conn, one[:]); err != nil {
+			return nil, err
+		}
+		if one[0] == FrameMagic {
+			break
+		}
+		log.Printf("magic number not equal 0xA5, continueing")
+		// otherwise keep scanning
+	}
+
+	// read remaining 3 bytes of header
+	rest := make([]byte, 3)
+	if _, err := io.ReadFull(conn, rest); err != nil {
+		return nil, err
+	}
+	payloadLen := int(rest[0])<<16 | int(rest[1])<<8 | int(rest[2])
+	if payloadLen == 0 {
+		return nil, nil
+	}
+	if maxAccept > 0 && payloadLen > maxAccept {
+		return nil, fmt.Errorf("payload too large: %d", payloadLen)
+	}
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// BuildDownloadPayload 构建下载请求的 payload
+func (p *ProtocolHelper) BuildDownloadPayload(nodeName string, fileHash uint64, needProof byte) []byte {
+	// opType=1
+	buf := make([]byte, 0, 1+8+8+1)
+	buf = append(buf, byte(1))
+	// nodeName 8 bytes
+	nb := make([]byte, NodeNameSize)
+	copy(nb, []byte(nodeName))
+	buf = append(buf, nb...)
+	// fileHash 8 bytes
+	var hbuf [8]byte
+	binary.BigEndian.PutUint64(hbuf[:], fileHash)
+	buf = append(buf, hbuf[:]...)
+	// needProof 1 byte
+	buf = append(buf, needProof)
+	return buf
+}
+
+// BuildUploadPayload 构建上传请求的 payload (op=0)
+func (p *ProtocolHelper) BuildUploadPayload(fileHash uint64, nodeName string, filename string, fileData []byte) []byte {
+	// opType=0
+	// op(1) + fileHash(8) + nodeName(8) + filename(16) + fileLen(4) + fileData
+	fileLen := uint32(len(fileData))
+	buf := make([]byte, 0, 1+8+8+16+4+len(fileData))
+	buf = append(buf, byte(0))
+	var hbuf [8]byte
+	binary.BigEndian.PutUint64(hbuf[:], fileHash)
+	buf = append(buf, hbuf[:]...)
+	nN := make([]byte, 8)
+	copy(nN, []byte(nodeName))
+	buf = append(buf, nN...)
+	fb := make([]byte, 16)
+	copy(fb, []byte(filename))
+	buf = append(buf, fb...)
+	var lenb [4]byte
+	binary.BigEndian.PutUint32(lenb[:], fileLen)
+	buf = append(buf, lenb[:]...)
+	buf = append(buf, fileData...)
+	return buf
+}
+
+// ParseStorageResponse 解析存储层响应 payload
+// 返回: fileHash, found, fileData(if found), proofData, indicesData, error
+func (p *ProtocolHelper) ParseStorageResponse(payload []byte) (uint64, bool, []byte, []byte, []byte, error) {
+	// payload starts with fileHash(8) + found(1)
+	if len(payload) < 9 {
+		return 0, false, nil, nil, nil, fmt.Errorf("payload too short")
+	}
+	fileHash := binary.BigEndian.Uint64(payload[0:8])
+	found := payload[8]
+	idx := 9
+	if found == 0 {
+		return fileHash, false, nil, nil, nil, nil
+	}
+	if len(payload) < idx+4 {
+		return fileHash, false, nil, nil, nil, fmt.Errorf("payload too short for fileLen")
+	}
+	fileLen := int(binary.BigEndian.Uint32(payload[idx : idx+4]))
+	idx += 4
+	if len(payload) < idx+fileLen {
+		return fileHash, false, nil, nil, nil, fmt.Errorf("payload too short for fileData")
+	}
+	fileData := payload[idx : idx+fileLen]
+	idx += fileLen
+	// proofFlag
+	if len(payload) == idx {
+		return fileHash, true, fileData, nil, nil, nil
+	}
+	proofFlag := payload[idx]
+	idx++
+	var proofData []byte
+	var indicesData []byte
+	if proofFlag == 1 {
+		if len(payload) < idx+2 {
+			return fileHash, true, fileData, nil, nil, fmt.Errorf("payload too short for merklePathLen")
+		}
+		merkleLen := int(binary.BigEndian.Uint16(payload[idx : idx+2]))
+		idx += 2
+		if len(payload) < idx+merkleLen {
+			return fileHash, true, fileData, nil, nil, fmt.Errorf("payload too short for merklePathData")
+		}
+		proofData = payload[idx : idx+merkleLen]
+		idx += merkleLen
+		if len(payload) < idx+2 {
+			return fileHash, true, fileData, proofData, nil, fmt.Errorf("payload too short for indicesLen")
+		}
+		indicesLen := int(binary.BigEndian.Uint16(payload[idx : idx+2]))
+		idx += 2
+		if len(payload) < idx+indicesLen {
+			return fileHash, true, fileData, proofData, nil, fmt.Errorf("payload too short for indicesData")
+		}
+		indicesData = payload[idx : idx+indicesLen]
+		idx += indicesLen
+	}
+	return fileHash, true, fileData, proofData, indicesData, nil
+}
 
 // WriteUint64 写入64位无符号整数（大端序）
 func (p *ProtocolHelper) WriteUint64(conn net.Conn, value uint64) error {
@@ -125,4 +285,48 @@ func (p *ProtocolHelper) ReceiveFileData(conn net.Conn, fileSize uint64) ([]byte
 		totalRead += uint64(n)
 	}
 	return data, nil
+}
+
+// VerifyMerkleProof 根据给定的叶子数据（内容 data）以及 proofData/indicesData 重新计算 Merkle root。
+// 约定：
+//   - proofData 是若干个 sibling 哈希依次连在一起，每个 sibling 长度为 sha256.Size（32）字节。
+//   - indicesData 是与 proofData 元素一一对应的字节序列，值为 1 表示 sibling 在右侧（当前为左），0 表示 sibling 在左侧（当前为右）。
+//
+// 返回：计算出的 Merkle root（字节切片），或 error（例如数据格式异常）。
+func (p *ProtocolHelper) VerifyMerkleProof(data []byte, proofData []byte, indicesData []byte) ([]byte, error) {
+	if len(proofData) == 0 {
+		// 没有证明，返回 leaf hash 作为 root（单节点树）
+		h := sha256.Sum256(data)
+		return h[:], nil
+	}
+	const hlen = sha256.Size
+	if len(proofData)%hlen != 0 {
+		return nil, fmt.Errorf("invalid proofData length: %d", len(proofData))
+	}
+	steps := len(proofData) / hlen
+	if len(indicesData) != steps {
+		return nil, fmt.Errorf("indicesData length %d != proof steps %d", len(indicesData), steps)
+	}
+
+	// 叶子哈希：按照示例使用原始 data 的 sha256
+	cur := sha256.Sum256(data)
+	curHash := cur[:]
+
+	for i := 0; i < steps; i++ {
+		sib := proofData[i*hlen : (i+1)*hlen]
+		var combined []byte
+		if indicesData[i] == 1 {
+			// sibling is right, current is left: Hash(cur || sib)
+			combined = append(curHash, sib...)
+		} else {
+			// sibling is left, current is right: Hash(sib || cur)
+			combined = append(sib, curHash...)
+		}
+		hh := sha256.Sum256(combined)
+		curHash = hh[:]
+	}
+	// curHash is computed root
+	out := make([]byte, len(curHash))
+	copy(out, curHash)
+	return out, nil
 }
