@@ -17,12 +17,13 @@ import (
 )
 
 // RunPipelineMode 执行流水线并发查询模式
-func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*network.TCPClient, files []os.DirEntry, ringToServer map[int]string, centerServer string, workerCount int, verify bool) {
+func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*network.TCPClient, files []os.DirEntry, ringToServer map[int]string, centerServer string, workerCount int, verify bool, cacheBytes int64, flushTimeout time.Duration) {
 	fmt.Println("=== 使用流水线模式 ===")
 	fmt.Printf("每个存储服务器连接使用 %d 个worker goroutine处理响应\n", workerCount)
 
-	// 构造本地的 fileHash -> 原始文件名 映射
+	// 构造本地的 fileHash -> 原始文件名/大小 映射
 	hashToName := make(map[uint64]string, len(files))
+	hashToSize := make(map[uint64]uint32, len(files))
 	for _, f := range files {
 		if f.IsDir() {
 			continue
@@ -31,6 +32,19 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 		hash := sha256.Sum256([]byte(name))
 		fileHash := binary.BigEndian.Uint64(hash[:8])
 		hashToName[fileHash] = name
+		// 使用本地 cid_files 中的文件大小作为 size hint（若不可读则为0）
+		if fi, err := os.Stat(filepath.Join("cid_files", name)); err == nil && fi.Mode().IsRegular() {
+			sz := fi.Size()
+			if sz < 0 {
+				sz = 0
+			}
+			if sz > int64(^uint32(0)) {
+				sz = int64(^uint32(0))
+			}
+			hashToSize[fileHash] = uint32(sz)
+		} else {
+			hashToSize[fileHash] = 0
+		}
 	}
 
 	hashFunc := func(fileName string) (string, uint64) {
@@ -262,7 +276,11 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 					if set := setPendingIfAbsent(t.FileHash); set {
 						atomic.AddInt64(&expectedCount, 1)
 					}
-					if !sess.TryEnqueue(t.Node, t.FileHash) {
+					sizeHint := uint32(0)
+					if t.Size > 0 {
+						sizeHint = uint32(t.Size)
+					}
+					if !sess.TryEnqueueWithSize(t.Node, t.FileHash, sizeHint) {
 						inF, p, qLen, lim := sess.Metrics()
 						fmt.Printf("[投递-回退] server=%s node=%s hash=%d 原因=sendCh满/限流 inFlight=%d pending=%d q=%d limit=%d\n", serverAddr, t.Node, t.FileHash, inF, p, qLen, lim)
 						select {
@@ -278,7 +296,19 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 		},
 		15,
 	)
-	queryPipeline.SetFlushTimeout(1 * time.Second)
+	// 使用配置中的超时与字节阈值
+	if flushTimeout > 0 {
+		queryPipeline.SetFlushTimeout(flushTimeout)
+	}
+	if cacheBytes > 0 {
+		queryPipeline.SetDefaultCacheBytes(cacheBytes)
+	}
+	queryPipeline.SetSizeFunc(func(fileName string, fileHash uint64) int {
+		if v, ok := hashToSize[fileHash]; ok {
+			return int(v)
+		}
+		return 0
+	})
 
 	queryCount := 0
 	fmt.Println("开始流水线查询文件...")

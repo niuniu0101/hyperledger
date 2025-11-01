@@ -1,6 +1,7 @@
 package network
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -173,8 +174,59 @@ func (c *TCPClient) QueryFile(nodeName string, fileHash uint64, fabricClient int
 
 	// If verification requested and proof provided, try to validate
 	if verify && len(proofData) > 0 {
+		// 打印收到的 Merkle 证明数据，按32字节切分
+		segLen := 32
+		if len(proofData)%segLen == 0 {
+			total := len(proofData) / segLen
+			fmt.Printf("[PROOF-DEBUG] merkle path segments=%d (totalBytes=%d)\n", total, len(proofData))
+			for i := 0; i < total; i++ {
+				seg := proofData[i*segLen : (i+1)*segLen]
+				fmt.Printf("[PROOF-DEBUG] path[%d]=%x\n", i, seg)
+			}
+		} else {
+			fmt.Printf("[PROOF-DEBUG] proofData 未对齐32字节，长度: %d\n", len(proofData))
+		}
+		fmt.Printf("[PROOF-DEBUG] indices len=%d values=", len(indicesData))
+		for i, idx := range indicesData {
+			if i > 0 {
+				fmt.Printf(",")
+			}
+			fmt.Printf("%d", idx)
+		}
+		fmt.Printf("\n")
+
+		// 手动再算一遍根哈希验证，并打印
+		hh := sha256.Sum256(data)
+		cur := make([]byte, len(hh))
+		copy(cur, hh[:])
+		fmt.Printf("[PROOF-DEBUG] leaf hash: %x\n", cur)
+		for i := 0; i < len(indicesData); i++ {
+			sibRaw := proofData[i*segLen : (i+1)*segLen]
+			sib := make([]byte, len(sibRaw))
+			copy(sib, sibRaw)
+			fmt.Printf("[PROOF-DEBUG] -- step %d sibling %x\n", i, sib)
+			var combined []byte
+			if indicesData[i] == 1 {
+				combined = make([]byte, 0, len(cur)+len(sib))
+				combined = append(combined, cur...)
+				combined = append(combined, sib...)
+			} else {
+				combined = make([]byte, 0, len(cur)+len(sib))
+				combined = append(combined, sib...)
+				combined = append(combined, cur...)
+			}
+			hnext := sha256.Sum256(combined)
+			nextCur := make([]byte, len(hnext))
+			copy(nextCur, hnext[:])
+			cur = nextCur
+			fmt.Printf("[PROOF-DEBUG] after level %d hash: %x\n", i, cur)
+		}
+		fmt.Printf("[PROOF-DEBUG] manually calculated merkle root: %x\n", cur)
+
 		// compute root from proof
 		computedRoot, err := helper.VerifyMerkleProof(data, proofData, indicesData)
+		fmt.Printf("计算出来的根哈希如下%x\n", computedRoot)
+		fmt.Printf("节点名和文件哈希如下%s %x\n", nodeName, fileHash)
 		if err != nil {
 			c.clearDeadlines(conn)
 			return 0, nil, fmt.Errorf("failed to compute merkle root from proof: %w", err)

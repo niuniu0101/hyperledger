@@ -183,17 +183,20 @@ func (p *ProtocolHelper) ParseStorageResponse(payload []byte) (uint64, bool, []b
 			return fileHash, true, fileData, nil, nil, fmt.Errorf("payload too short for merklePathLen")
 		}
 		merkleLen := int(binary.BigEndian.Uint16(payload[idx : idx+2]))
+		indicesLen := merkleLen
+		merkleLen *= 32
 		idx += 2
 		if len(payload) < idx+merkleLen {
 			return fileHash, true, fileData, nil, nil, fmt.Errorf("payload too short for merklePathData")
 		}
 		proofData = payload[idx : idx+merkleLen]
 		idx += merkleLen
-		if len(payload) < idx+2 {
-			return fileHash, true, fileData, proofData, nil, fmt.Errorf("payload too short for indicesLen")
-		}
-		indicesLen := int(binary.BigEndian.Uint16(payload[idx : idx+2]))
-		idx += 2
+		//if len(payload) < idx+2 {
+		//	return fileHash, true, fileData, proofData, nil, fmt.Errorf("payload too short for indicesLen")
+		//}
+		//indicesLen := int(binary.BigEndian.Uint16(payload[idx : idx+2]))
+		//idx += 2
+
 		if len(payload) < idx+indicesLen {
 			return fileHash, true, fileData, proofData, nil, fmt.Errorf("payload too short for indicesData")
 		}
@@ -299,7 +302,7 @@ func (p *ProtocolHelper) VerifyMerkleProof(data []byte, proofData []byte, indice
 		h := sha256.Sum256(data)
 		return h[:], nil
 	}
-	const hlen = sha256.Size
+	const hlen = 32
 	if len(proofData)%hlen != 0 {
 		return nil, fmt.Errorf("invalid proofData length: %d", len(proofData))
 	}
@@ -309,21 +312,34 @@ func (p *ProtocolHelper) VerifyMerkleProof(data []byte, proofData []byte, indice
 	}
 
 	// 叶子哈希：按照示例使用原始 data 的 sha256
-	cur := sha256.Sum256(data)
-	curHash := cur[:]
+	curHashRaw := sha256.Sum256(data)
+	fmt.Printf("数据如下%x\n", data[:12])
+	curHash := make([]byte, len(curHashRaw))
+	copy(curHash, curHashRaw[:])
+	fmt.Printf("当前哈希如下leaf hash      %x\n", curHash)
 
 	for i := 0; i < steps; i++ {
-		sib := proofData[i*hlen : (i+1)*hlen]
+		sibRaw := proofData[i*hlen : (i+1)*hlen]
+		sib := make([]byte, len(sibRaw))
+		copy(sib, sibRaw)
+		fmt.Printf("[PROOF-DEBUG] step %d sibling (sib) %x\n", i, sib)
 		var combined []byte
 		if indicesData[i] == 1 {
-			// sibling is right, current is left: Hash(cur || sib)
-			combined = append(curHash, sib...)
+			fmt.Printf("111\n")
+			combined = make([]byte, 0, len(curHash)+len(sib))
+			combined = append(combined, curHash...)
+			combined = append(combined, sib...)
 		} else {
-			// sibling is left, current is right: Hash(sib || cur)
-			combined = append(sib, curHash...)
+			fmt.Printf("222\n")
+			combined = make([]byte, 0, len(curHash)+len(sib))
+			combined = append(combined, sib...)
+			combined = append(combined, curHash...)
 		}
 		hh := sha256.Sum256(combined)
-		curHash = hh[:]
+		nextCur := make([]byte, len(hh))
+		copy(nextCur, hh[:])
+		curHash = nextCur
+		fmt.Printf("当前哈希如下after level %d: %x\n", i, curHash)
 	}
 	// curHash is computed root
 	out := make([]byte, len(curHash))

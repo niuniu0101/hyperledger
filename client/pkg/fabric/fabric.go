@@ -2,6 +2,7 @@ package fabric
 
 import (
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -106,15 +107,37 @@ func (fc *FabricClient) RemoveServerNode(ringID, serverName string) error {
 	return err
 }
 
-// UpdateMerkleRoot 更新指定环中节点的Merkle根哈希
+// UpdateMerkleRoot 更新指定环中节点的Merkle根哈希（异步提交，不等待提交状态）
 func (fc *FabricClient) UpdateMerkleRoot(ringID, serverName, newHash string) error {
-	_, err := fc.contract.SubmitTransaction("UpdateMerkleRoot", ringID, serverName, newHash)
+	// 异步提交事务，避免等待提交状态阶段触发底层 gRPC CommitStatus 调用
+	_, _, err := fc.contract.SubmitAsync(
+		"UpdateMerkleRoot",
+		client.WithArguments(ringID, serverName, newHash),
+	)
 	return err
 }
 
 // GetAllRingsData 获取所有环的数据
 func (fc *FabricClient) GetAllRingsData() ([]byte, error) {
 	return fc.contract.EvaluateTransaction("GetAllRingsData")
+}
+
+// 用于批量更新
+type BatchMerkleUpdateItem struct {
+	RingID, ServerName, MerkleRootHash string
+}
+
+// BatchUpdateMerkleRoots 批量更新指定环中节点的Merkle根哈希
+func (fc *FabricClient) BatchUpdateMerkleRoots(updates []BatchMerkleUpdateItem) error {
+	j, err := json.Marshal(updates)
+	if err != nil {
+		return err
+	}
+	_, _, err = fc.contract.SubmitAsync(
+		"BatchUpdateMerkleRoots",
+		client.WithArguments(string(j)),
+	)
+	return err
 }
 
 // --- 私有辅助函数 ---

@@ -30,6 +30,13 @@ type AllRingsContainer struct {
 	Rings map[string][]ServerNode `json:"rings"`
 }
 
+// 用于批量更新
+type BatchMerkleUpdateItem struct {
+	RingID         string `json:"ringID"`
+	ServerName     string `json:"serverName"`
+	MerkleRootHash string `json:"merkleRootHash"`
+}
+
 // InitLedger 初始化账本，创建指定数量的空环
 func (s *MultiRingManager) InitLedger(ctx contractapi.TransactionContextInterface) error {
 	log.Printf("Initializing the ledger with %d empty rings", numberOfRings)
@@ -77,7 +84,7 @@ func (s *MultiRingManager) InitLedgerWithCustomNodes(ctx contractapi.Transaction
 
 		newNode := ServerNode{
 			ServerName:     serverName,
-			MerkleRootHash: fmt.Sprintf("0xInitialHash%d", nodeIndex), // 默认哈希值
+			MerkleRootHash: "0000000000000000000000000000000000000000000000000000000000000000", // 默认哈希值
 		}
 		initialData.Rings[ringID] = append(initialData.Rings[ringID], newNode)
 	}
@@ -90,7 +97,7 @@ func (s *MultiRingManager) InitLedgerWithCustomNodes(ctx contractapi.Transaction
 		serverName := fmt.Sprintf("node%d", nodeIndex)
 		newNode := ServerNode{
 			ServerName:     serverName,
-			MerkleRootHash: fmt.Sprintf("0xInitialHash%d", nodeIndex),
+			MerkleRootHash: "0000000000000000000000000000000000000000000000000000000000000000", // 默认哈希值
 		}
 		initialData.Rings[ring4ID] = append(initialData.Rings[ring4ID], newNode)
 	}
@@ -103,7 +110,7 @@ func (s *MultiRingManager) InitLedgerWithCustomNodes(ctx contractapi.Transaction
 		serverName := fmt.Sprintf("node%d", nodeIndex)
 		newNode := ServerNode{
 			ServerName:     serverName,
-			MerkleRootHash: fmt.Sprintf("0xInitialHash%d", nodeIndex),
+			MerkleRootHash: "0000000000000000000000000000000000000000000000000000000000000000", // 默认哈希值
 		}
 		initialData.Rings[ring5ID] = append(initialData.Rings[ring5ID], newNode)
 	}
@@ -295,6 +302,55 @@ func (s *MultiRingManager) UpdateMerkleRoot(ctx contractapi.TransactionContextIn
 	}
 
 	return ctx.GetStub().PutState(allRingsKey, updatedRingsJSON)
+}
+
+// BatchUpdateMerkleRoots 批量更新默克尔树根哈希
+func (s *MultiRingManager) BatchUpdateMerkleRoots(ctx contractapi.TransactionContextInterface, batchJSON string) error {
+	var updates []BatchMerkleUpdateItem
+	if err := json.Unmarshal([]byte(batchJSON), &updates); err != nil {
+		return fmt.Errorf("invalid input: %w", err)
+	}
+	allRingsJSON, err := ctx.GetStub().GetState(allRingsKey)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %w", err)
+	}
+	if allRingsJSON == nil {
+		return fmt.Errorf("rings data not found")
+	}
+
+	var container AllRingsContainer
+	if err := json.Unmarshal(allRingsJSON, &container); err != nil {
+		return fmt.Errorf("failed to unmarshal rings container: %w", err)
+	}
+	for _, upd := range updates {
+		ring, ok := container.Rings[upd.RingID]
+		if ok {
+			found := false
+			for i := range ring {
+				if ring[i].ServerName == upd.ServerName {
+					ring[i].MerkleRootHash = upd.MerkleRootHash
+					found = true
+					break
+				}
+			}
+			if !found {
+				container.Rings[upd.RingID] = append(ring, ServerNode{
+					ServerName: upd.ServerName, MerkleRootHash: upd.MerkleRootHash,
+				})
+			} else {
+				container.Rings[upd.RingID] = ring
+			}
+		} else {
+			container.Rings[upd.RingID] = []ServerNode{{
+				ServerName: upd.ServerName, MerkleRootHash: upd.MerkleRootHash,
+			}}
+		}
+	}
+	updatedJSON, err := json.Marshal(container)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated container: %w", err)
+	}
+	return ctx.GetStub().PutState(allRingsKey, updatedJSON)
 }
 
 // GetAllRingsData 查询并返回所有环及其节点信息

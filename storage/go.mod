@@ -2,7 +2,10 @@ module github.com/hyperledger/storage
 
 go 1.23.11
 
-require github.com/klauspost/reedsolomon v1.12.5
+require (
+	github.com/cbergoon/merkletree v0.2.0
+	github.com/klauspost/reedsolomon v1.12.5
+)
 
 require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
