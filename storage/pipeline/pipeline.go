@@ -12,9 +12,8 @@ import (
 
 // 流水线配置
 const (
-	CacheSize     = 256 * 1024 // 256KB cache
-	BatchInterval = 100 * time.Millisecond
-	MaxBatchSize  = 100 * 1024 // 最大批量大小 100KB
+	BatchInterval = 10 * time.Microsecond
+	MaxBatchSize  = 256 * 1024 // 最大批量大小 100KB
 	QueueSize     = 10000
 	MaxProofSize  = 10 * 1024 // 最大证明大小 10KB
 )
@@ -432,7 +431,7 @@ func (p *Pipeline) batchFlusher() {
 
 	log.Println("Batch flusher started")
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(BatchInterval)
 	defer ticker.Stop()
 
 	for {
@@ -576,18 +575,24 @@ func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 
 	log.Printf("Preparing to send %d files with individual message headers", len(successResponses))
 
-	// 不再需要预先分配整个缓冲区，改为逐个发送
-	totalSentBytes := 0
-	totalFilesSent := 0
+	// 预计算总缓冲区大小
+	totalBufferSize := 0
+	for _, response := range successResponses {
+		// 每个文件：4字节消息头 + 消息体
+		totalBufferSize += 4 + calculateResponseSize(response)
+	}
+
+	// 创建总缓冲区
+	combinedBuffer := make([]byte, 0, totalBufferSize)
 	startTime := time.Now()
 
-	// 逐个发送每个文件响应（每个文件都有独立的消息头）
+	// 将每个文件的消息追加到总缓冲区
 	for _, response := range successResponses {
 		// 计算这个文件响应消息体的总长度
 		messageBodySize := calculateResponseSize(response)
 
-		// 创建这个文件响应的完整消息（包含4字节消息头 + 消息体）
-		message := make([]byte, 4+messageBodySize) // 4字节头 + 消息体
+		// 为这个文件创建消息缓冲区（包含4字节消息头 + 消息体）
+		message := make([]byte, 4+messageBodySize)
 		offset := 0
 
 		// 写入消息头 (4字节)
@@ -652,22 +657,22 @@ func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 				response.Request.FileName, len(message), offset)
 		}
 
-		// 发送这个文件的完整消息（包含消息头）
-		if err := writeAll(p.ClientConn, message); err != nil {
-			log.Printf("Failed to send file %s: %v", response.Request.FileName, err)
-			continue // 继续发送其他文件，不中断
-		}
+		// 将这个文件的消息追加到总缓冲区
+		combinedBuffer = append(combinedBuffer, message...)
 
-		totalSentBytes += len(message)
-		totalFilesSent++
-
-		log.Printf("Sent file in batch: %s, message size: %d bytes (header: 4 bytes, body: %d bytes), hash: %d, hasProof: %v",
+		log.Printf("Prepared file in batch: %s, message size: %d bytes (header: 4 bytes, body: %d bytes), hash: %d, hasProof: %v",
 			response.Request.FileName, len(message), messageBodySize, response.Request.FileHash, response.HasProof)
+	}
+
+	// 一次性发送所有文件的合并缓冲区
+	if err := writeAll(p.ClientConn, combinedBuffer); err != nil {
+		log.Printf("Failed to send batch: %v", err)
+		return
 	}
 
 	duration := time.Since(startTime)
 	log.Printf("Batch send completed: %d/%d files sent successfully, total bytes: %d, took %v",
-		totalFilesSent, len(successResponses), totalSentBytes, duration)
+		len(successResponses), len(successResponses), len(combinedBuffer), duration)
 }
 
 // 确保 writeAll 函数存在
@@ -678,6 +683,7 @@ func writeAll(conn net.Conn, data []byte) error {
 		if err != nil {
 			return fmt.Errorf("写入失败: %w", err)
 		}
+		log.Printf("写入 %d 字节到连接", n)
 		totalWritten += n
 	}
 	return nil

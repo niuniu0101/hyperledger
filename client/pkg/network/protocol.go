@@ -124,6 +124,37 @@ func (p *ProtocolHelper) BuildDownloadPayload(nodeName string, fileHash uint64, 
 	return buf
 }
 
+// BuildBatchDownloadPayload 构建批量下载请求的 payload（如果服务器支持）
+// opType=2, count(2) + [nodeName(8) + fileHash(8) + needProof(1)] * count
+func (p *ProtocolHelper) BuildBatchDownloadPayload(requests []struct {
+	NodeName  string
+	FileHash  uint64
+	NeedProof byte
+}) []byte {
+	count := uint16(len(requests))
+	if count == 0 {
+		return nil
+	}
+	buf := make([]byte, 0, 1+2+count*(8+8+1))
+	// opType=2 表示批量查询
+	buf = append(buf, byte(2))
+	// count 2 bytes
+	var countBuf [2]byte
+	binary.BigEndian.PutUint16(countBuf[:], count)
+	buf = append(buf, countBuf[:]...)
+	// 每个请求：nodeName(8) + fileHash(8) + needProof(1)
+	for _, req := range requests {
+		nb := make([]byte, NodeNameSize)
+		copy(nb, []byte(req.NodeName))
+		buf = append(buf, nb...)
+		var hbuf [8]byte
+		binary.BigEndian.PutUint64(hbuf[:], req.FileHash)
+		buf = append(buf, hbuf[:]...)
+		buf = append(buf, req.NeedProof)
+	}
+	return buf
+}
+
 // BuildUploadPayload 构建上传请求的 payload (op=0)
 func (p *ProtocolHelper) BuildUploadPayload(fileHash uint64, nodeName string, filename string, fileData []byte) []byte {
 	// opType=0

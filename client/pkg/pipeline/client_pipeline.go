@@ -123,11 +123,24 @@ func (p *ClientPipeline) PushWorkload(fileName string, data []byte) {
 }
 
 func (p *ClientPipeline) shouldFlush(node string) bool {
-	// 仅按字节阈值 + 时间窗口 判断
+	cache := p.cacheMap[node]
+	if len(cache) == 0 {
+		return false
+	}
+
+	// 按数量阈值判断（优先于字节阈值）
+	capSize := p.cacheConfig.GetNodeCacheSize(node)
+	if capSize > 0 && len(cache) >= capSize {
+		return true
+	}
+
+	// 按字节阈值判断
 	capBytes := p.cacheConfig.GetNodeCacheBytes(node)
 	if capBytes > 0 && p.cacheBytes[node] >= capBytes {
 		return true
 	}
+
+	// 按时间窗口判断
 	if timestamp, exists := p.cacheTimestamp[node]; exists {
 		if time.Since(timestamp) >= p.flushTimeout {
 			return true

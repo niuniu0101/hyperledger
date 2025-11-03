@@ -18,7 +18,7 @@ func UploadSerial(hrm *consistent.HashRingManager, centerClient *network.TCPClie
 	uploadCount := 0
 	fmt.Println("开始串行上传文件...")
 	for _, file := range files {
-		if uploadCount >= 5000 || file.IsDir() {
+		if uploadCount >= 10000 || file.IsDir() {
 			continue
 		}
 
@@ -29,14 +29,15 @@ func UploadSerial(hrm *consistent.HashRingManager, centerClient *network.TCPClie
 			continue
 		}
 
-		hash := sha256.Sum256([]byte(file.Name()))
-		fileHash := binary.BigEndian.Uint64(hash[:8])
-		ringID := fmt.Sprintf("ring%d", fileHash%4)
-
 		fileName := file.Name()
 		if len(fileName) > 16 {
 			fileName = fileName[:16]
 		}
+
+		hash := sha256.Sum256([]byte(fileName))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		ringID := fmt.Sprintf("ring%d", fileHash%4)
+
 		nodeName := hrm.LocateKey(ringID, fileName)
 
 		if nodeName == "" {

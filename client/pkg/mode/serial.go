@@ -63,19 +63,19 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	}
 
 	for _, file := range files {
-		if queryCount >= 30 || file.IsDir() {
+		if queryCount >= 10000 || file.IsDir() {
 			continue
 		}
-
-		hash := sha256.Sum256([]byte(file.Name()))
-		fileHash := binary.BigEndian.Uint64(hash[:8])
-		ring := int(fileHash % 4)
-		ringID := fmt.Sprintf("ring%d", ring)
 
 		fileName := file.Name()
 		if len(fileName) > 16 {
 			fileName = fileName[:16]
 		}
+		hash := sha256.Sum256([]byte(fileName))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		ring := int(fileHash % 4)
+		ringID := fmt.Sprintf("ring%d", ring)
+
 		nodeName := hrm.LocateKey(ringID, fileName)
 
 		if nodeName == "" {

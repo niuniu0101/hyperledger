@@ -29,6 +29,9 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 			continue
 		}
 		name := f.Name()
+		if len(name) > 16 {
+			name = name[:16]
+		}
 		hash := sha256.Sum256([]byte(name))
 		fileHash := binary.BigEndian.Uint64(hash[:8])
 		hashToName[fileHash] = name
@@ -48,14 +51,15 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 	}
 
 	hashFunc := func(fileName string) (string, uint64) {
-		hash := sha256.Sum256([]byte(fileName))
-		fileHash := binary.BigEndian.Uint64(hash[:8])
-		ringID := fmt.Sprintf("ring%d", fileHash%4)
 
 		shortName := fileName
 		if len(shortName) > 16 {
 			shortName = shortName[:16]
 		}
+		hash := sha256.Sum256([]byte(shortName))
+		fileHash := binary.BigEndian.Uint64(hash[:8])
+		ringID := fmt.Sprintf("ring%d", fileHash%4)
+
 		return hrm.LocateKey(ringID, shortName), fileHash
 	}
 
@@ -313,7 +317,7 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 	queryCount := 0
 	fmt.Println("开始流水线查询文件...")
 	for _, file := range files {
-		if queryCount >= 5000 || file.IsDir() {
+		if queryCount >= 8000 || file.IsDir() {
 			continue
 		}
 		queryPipeline.PushWorkload(file.Name(), nil)
