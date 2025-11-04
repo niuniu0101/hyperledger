@@ -13,7 +13,7 @@ import (
 // 流水线配置
 const (
 	BatchInterval = 10 * time.Microsecond
-	MaxBatchSize  = 256 * 1024 // 最大批量大小 100KB
+	MaxBatchSize  = 0 * 1024 // 最大批量大小 100KB
 	QueueSize     = 10000
 	MaxProofSize  = 10 * 1024 // 最大证明大小 10KB
 )
@@ -243,8 +243,8 @@ func (p *Pipeline) Start() {
 		go stage()
 	}
 
-	log.Printf("Download pipeline started with batch interval: %v, max batch size: %d bytes",
-		BatchInterval, MaxBatchSize)
+	// log.Printf("Download pipeline started with batch interval: %v, max batch size: %d bytes",
+	//	BatchInterval, MaxBatchSize)
 }
 
 // 停止流水线 - 优雅关闭
@@ -269,37 +269,25 @@ func (p *Pipeline) Stop() {
 	// 带超时的等待
 	select {
 	case <-done:
-		log.Println("Download pipeline stopped gracefully")
+		// log.Println("Download pipeline stopped gracefully")
 	case <-time.After(5 * time.Second):
-		log.Println("Download pipeline stop timeout, forcing shutdown")
+		// log.Println("Download pipeline stop timeout, forcing shutdown")
 	}
 
 	atomic.StoreInt32((*int32)(&p.status), int32(StatusStopped))
 }
 
-// 检查流水线是否运行
-func (p *Pipeline) IsRunning() bool {
-	return atomic.LoadInt32((*int32)(&p.status)) == int32(StatusRunning)
-}
-
 // 提交下载请求
 func (p *Pipeline) SubmitDownloadRequest(request *DownloadRequest) bool {
 	p.ClientConn = request.Conn // 设置连接
-	if !p.IsRunning() {
-		log.Printf("Pipeline not running, request rejected: %s", request.FileName)
-		return false
-	}
 
 	request.Timestamp = time.Now()
 
 	select {
 	case p.ReceiveQueue <- request:
-		log.Printf("Download request submitted: %s (needProof: %v)", request.FileName, request.NeedProof)
+		// log.Printf("Download request submitted: %s (needProof: %v)", request.FileName, request.NeedProof)
 		return true
 	case <-p.stopChan:
-		return false
-	default:
-		log.Printf("Receive queue full, request rejected: %s", request.FileName)
 		return false
 	}
 }
@@ -309,9 +297,9 @@ func (p *Pipeline) SubmitDownloadRequest(request *DownloadRequest) bool {
 // 接收阶段
 func (p *Pipeline) receiveStage() {
 	defer p.wg.Done()
-	defer log.Println("Receive stage stopped")
+	defer func() { /*log.Println("Receive stage stopped")*/ }()
 
-	log.Println("Receive stage started")
+	// log.Println("Receive stage started")
 
 	for {
 		select {
@@ -319,30 +307,13 @@ func (p *Pipeline) receiveStage() {
 			if !ok {
 				return
 			}
-
-			if !p.IsRunning() {
-				// 如果流水线已停止，拒绝处理新请求
-				log.Printf("Pipeline not running, rejecting request: %s", request.FileName)
-				continue
-			}
-
-			log.Printf("Receive stage processing: %s", request.FileName)
+			// log.Printf("Receive stage processing: %s", request.FileName)
 
 			select {
 			case p.ReadQueue <- request:
-				log.Printf("Request forwarded to read stage: %s", request.FileName)
+				// log.Printf("Request forwarded to read stage: %s", request.FileName)
 			case <-p.stopChan:
 				return
-			default:
-				log.Printf("Read queue full, request delayed: %s", request.FileName)
-				// 队列满时，等待一段时间再重试
-				select {
-				case p.ReadQueue <- request:
-				case <-time.After(100 * time.Millisecond):
-					log.Printf("Failed to forward request after retry: %s", request.FileName)
-				case <-p.stopChan:
-					return
-				}
 			}
 
 		case <-p.stopChan:
@@ -356,7 +327,7 @@ func (p *Pipeline) readStage() {
 	defer p.wg.Done()
 	defer log.Println("Read stage stopped")
 
-	log.Println("Read stage started")
+	// log.Println("Read stage started")
 
 	for {
 		select {
@@ -364,28 +335,12 @@ func (p *Pipeline) readStage() {
 			if !ok {
 				return
 			}
-
-			if !p.IsRunning() {
-				continue
-			}
-
-			log.Printf("Read stage processing: %s (needProof: %v)", request.FileName, request.NeedProof)
+			// log.Printf("Read stage processing: %s (needProof: %v)", request.FileName, request.NeedProof)
 
 			var responseData []byte
 			var err error
 
-			// 读取数据
-			if p.readHandler != nil {
-				responseData, err = p.readHandler(request.FileName)
-				if err != nil {
-					log.Printf("Failed to read file %s: %v", request.FileName, err)
-				}
-			} else {
-				err = p.simulateReadOperation(request)
-				if err == nil {
-					responseData = []byte(fmt.Sprintf("data_for_%s", request.FileName))
-				}
-			}
+			responseData, err = p.readHandler(request.FileName)
 
 			response := &DownloadResponse{
 				Request:   request,
@@ -398,25 +353,25 @@ func (p *Pipeline) readStage() {
 			if request.NeedProof && p.proofHandler != nil && err == nil {
 				merklePath, indices, proofErr := p.proofHandler(request.NodeName, request.FileName, responseData)
 				if proofErr != nil {
-					log.Printf("Failed to generate proof for %s: %v", request.FileName, proofErr)
+					// log.Printf("Failed to generate proof for %s: %v", request.FileName, proofErr)
 				} else {
 					response.HasProof = true
 					response.MerklePath = merklePath
 					response.Indices = indices
-					log.Printf("Generated proof for %s: %d path elements", request.FileName, len(merklePath))
+					// log.Printf("Generated proof for %s: %d path elements", request.FileName, len(merklePath))
 				}
 			}
 
 			// 添加到批量缓存，并根据缓存大小决定是否刷新
 			if shouldFlush := p.BatchCache.AddResponse(request.FileName, response); shouldFlush {
-				log.Printf("Batch size limit reached (%d bytes), flushing batch", p.BatchCache.Size())
+				// log.Printf("Batch size limit reached (%d bytes), flushing batch", p.BatchCache.Size())
 				if batch := p.BatchCache.Flush(); batch != nil {
 					p.sendBatchData(batch)
 				}
 			}
 
-			log.Printf("Response cached: %s, batch size: %d bytes, files: %d, hasProof: %v",
-				request.FileName, p.BatchCache.Size(), p.BatchCache.FileCount(), response.HasProof)
+			// log.Printf("Response cached: %s, batch size: %d bytes, files: %d, hasProof: %v",
+			//	request.FileName, p.BatchCache.Size(), p.BatchCache.FileCount(), response.HasProof)
 
 		case <-p.stopChan:
 			return
@@ -427,9 +382,9 @@ func (p *Pipeline) readStage() {
 // 批量刷新器
 func (p *Pipeline) batchFlusher() {
 	defer p.wg.Done()
-	defer log.Println("Batch flusher stopped")
+	defer func() { /*log.Println("Batch flusher stopped")*/ }()
 
-	log.Println("Batch flusher started")
+	// log.Println("Batch flusher started")
 
 	ticker := time.NewTicker(BatchInterval)
 	defer ticker.Stop()
@@ -437,13 +392,9 @@ func (p *Pipeline) batchFlusher() {
 	for {
 		select {
 		case <-ticker.C:
-			if !p.IsRunning() {
-				return
-			}
-
 			if p.BatchCache.ShouldFlush() {
-				currentSize := p.BatchCache.Size()
-				log.Printf("Batch interval reached, flushing batch (size: %d bytes)", currentSize)
+				// currentSize := p.BatchCache.Size()
+				// log.Printf("Batch interval reached, flushing batch (size: %d bytes)", currentSize)
 				if batch := p.BatchCache.Flush(); batch != nil {
 					p.sendBatchData(batch)
 				}
@@ -455,106 +406,9 @@ func (p *Pipeline) batchFlusher() {
 	}
 }
 
-// ==================== 辅助方法 ====================
-
-// 发送批量数据到客户端 - 按照新协议格式
-// func (p *Pipeline) sendBatchData(batch *BatchPacket) {
-// 	if p.ClientConn == nil {
-// 		log.Printf("No client connection available, cannot send batch")
-// 		return
-// 	}
-
-// 	// 筛选成功的响应
-// 	successResponses := make([]*DownloadResponse, 0, len(batch.Responses))
-// 	for _, response := range batch.Responses {
-// 		if response.Error != nil {
-// 			log.Printf("Skipping failed file %s: %v", response.Request.FileName, response.Error)
-// 			continue
-// 		}
-// 		successResponses = append(successResponses, response)
-// 	}
-
-// 	if len(successResponses) == 0 {
-// 		log.Printf("No successful files to send in this batch")
-// 		return
-// 	}
-
-// 	log.Printf("Preparing to send %d files, total data size: %d bytes",
-// 		len(successResponses), batch.TotalSize)
-
-// 	// 创建缓冲区
-// 	buffer := make([]byte, batch.TotalSize)
-// 	offset := 0
-
-// 	// 写入每个文件的数据和证明
-// 	for _, response := range successResponses {
-// 		// 写入文件哈希 (8字节)
-// 		binary.BigEndian.PutUint64(buffer[offset:offset+8], response.Request.FileHash)
-// 		offset += 8
-
-// 		// 写入是否找到数据 (1字节) - 总是1，因为我们已经过滤了失败的
-// 		buffer[offset] = 1
-// 		offset += 1
-
-// 		// 写入文件长度 (4字节)
-// 		binary.BigEndian.PutUint32(buffer[offset:offset+4], uint32(len(response.Data)))
-// 		offset += 4
-
-// 		// 写入文件内容
-// 		copy(buffer[offset:offset+len(response.Data)], response.Data)
-// 		offset += len(response.Data)
-
-// 		// 写入是否有证明 (1字节)
-// 		if response.HasProof {
-// 			buffer[offset] = 1
-// 			offset += 1
-
-// 			// 写入Merkle Path长度 (2字节)
-// 			pathLength := uint16(len(response.MerklePath))
-// 			binary.BigEndian.PutUint16(buffer[offset:offset+2], pathLength)
-// 			offset += 2
-
-// 			// 写入Merkle Path数据 (每个哈希32字节)
-// 			for _, pathHash := range response.MerklePath {
-// 				copy(buffer[offset:offset+32], pathHash)
-// 				offset += 32
-// 			}
-
-// 			// 写入Indices数组 (每个1字节)
-// 			for _, index := range response.Indices {
-// 				buffer[offset] = byte(index)
-// 				offset += 1
-// 			}
-// 		} else {
-// 			buffer[offset] = 0
-// 			offset += 1
-// 		}
-
-// 		log.Printf("Added file to batch: %s, size: %d bytes, hash: %d, hasProof: %v",
-// 			response.Request.FileName, len(response.Data), response.Request.FileHash, response.HasProof)
-// 	}
-
-// 	// 验证缓冲区写入正确
-// 	if offset != batch.TotalSize {
-// 		log.Printf("Warning: buffer size mismatch, expected %d, got %d", batch.TotalSize, offset)
-// 	}
-
-// 	// 一次性发送所有数据
-// 	startTime := time.Now()
-
-// 	if err := writeAll(p.ClientConn, buffer); err != nil {
-// 		log.Printf("Failed to send batch data: %v", err)
-// 		return
-// 	}
-
-// 	duration := time.Since(startTime)
-// 	log.Printf("Batch sent successfully: %d files, %d bytes, took %v",
-// 		len(successResponses), batch.TotalSize, duration)
-// }
-
 func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 	if p.ClientConn == nil {
-		log.Printf("No client connection available, cannot send batch")
+		// log.Printf("No client connection available, cannot send batch")
 		return
 	}
 
@@ -562,18 +416,18 @@ func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 	successResponses := make([]*DownloadResponse, 0, len(batch.Responses))
 	for _, response := range batch.Responses {
 		if response.Error != nil {
-			log.Printf("Skipping failed file %s: %v", response.Request.FileName, response.Error)
+			// log.Printf("Skipping failed file %s: %v", response.Request.FileName, response.Error)
 			continue
 		}
 		successResponses = append(successResponses, response)
 	}
 
 	if len(successResponses) == 0 {
-		log.Printf("No successful files to send in this batch")
+		// log.Printf("No successful files to send in this batch")
 		return
 	}
 
-	log.Printf("Preparing to send %d files with individual message headers", len(successResponses))
+	// log.Printf("Preparing to send %d files with individual message headers", len(successResponses))
 
 	// 预计算总缓冲区大小
 	totalBufferSize := 0
@@ -584,7 +438,7 @@ func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 
 	// 创建总缓冲区
 	combinedBuffer := make([]byte, 0, totalBufferSize)
-	startTime := time.Now()
+	//startTime := time.Now()
 
 	// 将每个文件的消息追加到总缓冲区
 	for _, response := range successResponses {
@@ -660,8 +514,8 @@ func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 		// 将这个文件的消息追加到总缓冲区
 		combinedBuffer = append(combinedBuffer, message...)
 
-		log.Printf("Prepared file in batch: %s, message size: %d bytes (header: 4 bytes, body: %d bytes), hash: %d, hasProof: %v",
-			response.Request.FileName, len(message), messageBodySize, response.Request.FileHash, response.HasProof)
+		//log.Printf("Prepared file in batch: %s, message size: %d bytes (header: 4 bytes, body: %d bytes), hash: %d, hasProof: %v",
+		//response.Request.FileName, len(message), messageBodySize, response.Request.FileHash, response.HasProof)
 	}
 
 	// 一次性发送所有文件的合并缓冲区
@@ -670,9 +524,9 @@ func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 		return
 	}
 
-	duration := time.Since(startTime)
-	log.Printf("Batch send completed: %d/%d files sent successfully, total bytes: %d, took %v",
-		len(successResponses), len(successResponses), len(combinedBuffer), duration)
+	//duration := time.Since(startTime)
+	//log.Printf("Batch send completed: %d/%d files sent successfully, total bytes: %d, took %v",
+	//len(successResponses), len(successResponses), len(combinedBuffer), duration)
 }
 
 // 确保 writeAll 函数存在
@@ -687,41 +541,4 @@ func writeAll(conn net.Conn, data []byte) error {
 		totalWritten += n
 	}
 	return nil
-}
-
-// 模拟读取操作
-func (p *Pipeline) simulateReadOperation(request *DownloadRequest) error {
-	time.Sleep(10 * time.Millisecond)
-	log.Printf("Simulated read operation for: %s", request.FileName)
-	return nil
-}
-
-// ==================== 状态和工具方法 ====================
-
-// 获取流水线状态
-func (p *Pipeline) GetStats() map[string]interface{} {
-	return map[string]interface{}{
-		"status":           p.status.String(),
-		"is_running":       p.IsRunning(),
-		"receive_queue":    len(p.ReceiveQueue),
-		"read_queue":       len(p.ReadQueue),
-		"batch_size_bytes": p.BatchCache.Size(),
-		"batch_file_count": p.BatchCache.FileCount(),
-		"batch_max_size":   p.BatchCache.maxBatchSize,
-	}
-}
-
-// 强制刷新批量缓存
-func (p *Pipeline) FlushBatch() {
-	if batch := p.BatchCache.Flush(); batch != nil {
-		p.sendBatchData(batch)
-		log.Printf("Manually flushed batch with %d responses, total %d bytes",
-			len(batch.Responses), batch.TotalSize)
-	}
-}
-
-// 设置最大批量大小
-func (p *Pipeline) SetMaxBatchSize(size int) {
-	p.BatchCache.maxBatchSize = size
-	log.Printf("Max batch size set to %d bytes", size)
 }

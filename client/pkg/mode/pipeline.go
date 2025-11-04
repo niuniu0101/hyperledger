@@ -74,6 +74,12 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 	var receivedCount int64
 	var recvWG sync.WaitGroup
 
+	// 统计里程碑：成功写入7500个文件时输出耗时与吞吐
+	startTime := time.Now()
+	var successWrites int64
+	var totalBytes int64
+	var milestonePrinted int32
+
 	// 全局查询状态表：0-pending, 1-success, 2-failed
 	const (
 		statePending = int32(0)
@@ -133,7 +139,7 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 					return
 				}
 				if sess, ok := sessions[centerServer]; ok && sess != nil {
-					fmt.Printf("[回退ing] to %v\n", centerServer)
+					//fmt.Printf("[回退ing] to %v\n", centerServer)
 					size := uint32(0)
 					if !sess.TryEnqueueWithSize(t.NodeName, t.FileHash, size) {
 						go sess.EnqueueWithSize(t.NodeName, t.FileHash, size)
@@ -200,7 +206,20 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 						if ensureCounted(res.RequestHash, stateSuccess) {
 							atomic.AddInt64(&receivedCount, 1)
 						}
-						fmt.Printf("[成功] ring=%d server=%s node=%s hash=%d 文件=%s\n", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName)
+						// 达到7500个成功写入时，输出吞吐与时间
+						atomic.AddInt64(&totalBytes, int64(len(res.Data)))
+						if cur := atomic.AddInt64(&successWrites, 1); cur == 7900 {
+							if atomic.CompareAndSwapInt32(&milestonePrinted, 0, 1) {
+								elapsed := time.Since(startTime)
+								mb := float64(atomic.LoadInt64(&totalBytes)) / (1024 * 1024)
+								rate := 0.0
+								if elapsed.Seconds() > 0 {
+									rate = mb / elapsed.Seconds()
+								}
+								fmt.Printf("[里程碑] 成功写入7500个文件: 耗时=%v 吞吐率=%.2f MB/s (累计=%.2f MB)\n", elapsed, rate, mb)
+							}
+						}
+						//fmt.Printf("[成功] ring=%d server=%s node=%s hash=%d 文件=%s\n", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName)
 						continue
 					}
 				}
@@ -208,11 +227,11 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 					atomic.AddInt64(&receivedCount, 1)
 				}
 				if res.Err != nil {
-					fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d err=%v -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash, res.Err)
+					//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d err=%v -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash, res.Err)
 				} else if len(res.Data) == 0 {
-					fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未命中 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
+					//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未命中 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
 				} else {
-					fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未匹配文件名 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
+					//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未匹配文件名 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
 				}
 				select {
 				case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:

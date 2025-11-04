@@ -187,7 +187,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 				}
 				conn, err := s.client.ensureConn()
 				if err != nil {
-					log.Printf("[writer] addr=%s ensureConn error: %v (hash=%d node=%s)", s.client.ServerAddr(), err, req.FileHash, req.NodeName)
+					//log.Printf("[writer] addr=%s ensureConn error: %v (hash=%d node=%s)", s.client.ServerAddr(), err, req.FileHash, req.NodeName)
 					if nodeName, expected, exists := s.removePending(req.FileHash); exists {
 						atomic.AddInt64(&s.inFlight, -1)
 						if expected > 0 {
@@ -198,7 +198,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 					continue
 				}
 				if err := s.client.setWriteDeadline(conn); err != nil {
-					log.Printf("[writer] addr=%s setWriteDeadline error: %v (hash=%d node=%s)", s.client.ServerAddr(), err, req.FileHash, req.NodeName)
+					//log.Printf("[writer] addr=%s setWriteDeadline error: %v (hash=%d node=%s)", s.client.ServerAddr(), err, req.FileHash, req.NodeName)
 					if nodeName, expected, exists := s.removePending(req.FileHash); exists {
 						atomic.AddInt64(&s.inFlight, -1)
 						if expected > 0 {
@@ -214,9 +214,9 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 					need = 1
 				}
 				payload := s.client.helper.BuildDownloadPayload(req.NodeName, req.FileHash, need)
-				log.Printf("[writer] addr=%s sending frame hash=%d node=%s", s.client.ServerAddr(), req.FileHash, req.NodeName)
+				//log.Printf("[writer] addr=%s sending frame hash=%d node=%s", s.client.ServerAddr(), req.FileHash, req.NodeName)
 				if err := s.client.helper.WriteFrame(conn, payload); err != nil {
-					log.Printf("[writer] addr=%s WriteFrame error: %v (hash=%d node=%s)", s.client.ServerAddr(), err, req.FileHash, req.NodeName)
+					//log.Printf("[writer] addr=%s WriteFrame error: %v (hash=%d node=%s)", s.client.ServerAddr(), err, req.FileHash, req.NodeName)
 					if nodeName, expected, exists := s.removePending(req.FileHash); exists {
 						atomic.AddInt64(&s.inFlight, -1)
 						if expected > 0 {
@@ -226,7 +226,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 					}
 					continue
 				}
-				log.Printf("[writer] addr=%s sent frame hash=%d", s.client.ServerAddr(), req.FileHash)
+				//log.Printf("[writer] addr=%s sent frame hash=%d", s.client.ServerAddr(), req.FileHash)
 				s.client.clearDeadlines(conn)
 			}
 		}
@@ -247,7 +247,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 				// 清理超过读取超时时间的请求（与 ReadDeadline 保持一致，避免误删仍可能返回的请求）
 				timeouts := s.cleanupTimeoutRequests(2 * time.Minute)
 				if len(timeouts) > 0 {
-					log.Printf("[超时清理] 清理了 %d 个超时请求 (>=2m)", len(timeouts))
+					//log.Printf("[超时清理] 清理了 %d 个超时请求 (>=2m)", len(timeouts))
 					for _, e := range timeouts {
 						if e.Hash == 0 {
 							log.Printf("[超时清理] 跳过hash=0的请求")
@@ -321,7 +321,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 			// 使用帧协议读取 payload 并解析
 			payload, err := s.client.helper.ReadFrame(conn, 200*1024*1024) // 最大接受200MB
 			if err != nil {
-				log.Printf("[reader] addr=%s ReadFrame error: %v", s.client.ServerAddr(), err)
+				//log.Printf("[reader] addr=%s ReadFrame error: %v", s.client.ServerAddr(), err)
 				select {
 				case s.responseCh <- rawResponse{Err: fmt.Errorf("failed to read frame from server: %w", err), Timestamp: time.Now()}:
 				case <-s.closed:
@@ -332,7 +332,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 			// 解析存储层响应（包含可选的 merkle proof）
 			returnedHash, _, data, proofData, indicesData, perr := s.client.helper.ParseStorageResponse(payload)
 			if perr != nil {
-				log.Printf("[reader] addr=%s ParseStorageResponse error: %v", s.client.ServerAddr(), perr)
+				//log.Printf("[reader] addr=%s ParseStorageResponse error: %v", s.client.ServerAddr(), perr)
 				select {
 				case s.responseCh <- rawResponse{Err: perr, Timestamp: time.Now()}:
 				case <-s.closed:
@@ -347,7 +347,7 @@ func (c *TCPClient) StartAsyncQueryWithWorkers(buffer int, workerCount int, need
 			var lenBuf [8]byte
 			binary.BigEndian.PutUint64(lenBuf[:], uint64(len(data)))
 			s.client.clearDeadlines(conn)
-			log.Printf("[reader] addr=%s received frame hash=%d len=%d", s.client.ServerAddr(), returnedHash, len(data))
+			//log.Printf("[reader] addr=%s received frame hash=%d len=%d", s.client.ServerAddr(), returnedHash, len(data))
 			select {
 			case s.responseCh <- rawResponse{
 				HashBuf:     hashBuf[:],

@@ -102,12 +102,12 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		returnedHash, data, err := queryClient.QueryFile(nodeName, fileHash, adapter, verify)
 		if err != nil || len(data) < 1 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
 			if err != nil {
-				fmt.Printf("从 %s 查询失败: %v，回退中心\n", serverAddr, err)
+				//fmt.Printf("从 %s 查询失败: %v，回退中心\n", serverAddr, err)
 			}
 			returnedHash, data, err = centerClient.QueryFile(nodeName, fileHash, adapter, verify)
 			if err != nil {
-				logMsg := fmt.Sprintf("中心服务器查询失败: %s, err: %v", file.Name(), err)
-				fmt.Println(logMsg)
+				//logMsg := fmt.Sprintf("中心服务器查询失败: %s, err: %v", file.Name(), err)
+				//fmt.Println(logMsg)
 				failCount++
 				queryCount++
 				continue
@@ -132,8 +132,8 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 			fmt.Println(logMsg)
 			failCount++
 		} else {
-			logMsg := fmt.Sprintf("串行查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
-			fmt.Println(logMsg)
+			//logMsg := fmt.Sprintf("串行查询并写入成功: %s (ring%d, server: %s)", outName, ring, serverAddr)
+			//fmt.Println(logMsg)
 			successCount++
 		}
 		queryCount++
