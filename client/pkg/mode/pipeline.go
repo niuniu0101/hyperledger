@@ -345,7 +345,7 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 	queryCount := 0
 	fmt.Println("开始流水线查询文件...")
 	for _, file := range files {
-		if queryCount >= 50 || file.IsDir() {
+		if queryCount >= 9000 || file.IsDir() {
 			continue
 		}
 		queryPipeline.PushWorkload(file.Name(), nil)

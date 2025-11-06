@@ -353,15 +353,15 @@ func (p *ProtocolHelper) VerifyMerkleProof(data []byte, proofData []byte, indice
 		sibRaw := proofData[i*hlen : (i+1)*hlen]
 		sib := make([]byte, len(sibRaw))
 		copy(sib, sibRaw)
-		fmt.Printf("[PROOF-DEBUG] step %d sibling (sib) %x\n", i, sib)
+		// fmt.Printf("[PROOF-DEBUG] step %d sibling (sib) %x\n", i, sib)
 		var combined []byte
 		if indicesData[i] == 1 {
-			fmt.Printf("111\n")
+			// fmt.Printf("111\n")
 			combined = make([]byte, 0, len(curHash)+len(sib))
 			combined = append(combined, curHash...)
 			combined = append(combined, sib...)
 		} else {
-			fmt.Printf("222\n")
+			// fmt.Printf("222\n")
 			combined = make([]byte, 0, len(curHash)+len(sib))
 			combined = append(combined, sib...)
 			combined = append(combined, curHash...)
@@ -370,7 +370,7 @@ func (p *ProtocolHelper) VerifyMerkleProof(data []byte, proofData []byte, indice
 		nextCur := make([]byte, len(hh))
 		copy(nextCur, hh[:])
 		curHash = nextCur
-		fmt.Printf("当前哈希如下after level %d: %x\n", i, curHash)
+		// fmt.Printf("当前哈希如下after level %d: %x\n", i, curHash)
 	}
 	// curHash is computed root
 	out := make([]byte, len(curHash))

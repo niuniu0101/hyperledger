@@ -64,7 +64,7 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	}
 
 	for _, file := range files {
-		if queryCount >= 1000 || file.IsDir() {
+		if queryCount >= 10000 || file.IsDir() {
 			continue
 		}
 
