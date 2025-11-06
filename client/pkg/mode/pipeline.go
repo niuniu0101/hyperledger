@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,94 +154,97 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 	}()
 
 	for ring := 0; ring <= 3; ring++ {
-		addr, ok := ringToServer[ring]
+		host, ok := ringToServer[ring]
 		if !ok {
 			continue
 		}
-		cli := serverClients[addr]
-		if cli == nil {
-			continue
-		}
-		// trustedRootLookup uses hrm cache first
-		sess, err := cli.StartAsyncQueryWithWorkers(1024, workerCount, verify, func(node string) (string, error) {
-			if verify {
-				if v, ok := hrm.GetMerkleRootHash(node); ok {
-					if len(v) >= 2 && (v[0:2] == "0x" || v[0:2] == "0X") {
-						return v[2:], nil
-					}
-					return v, nil
-				}
-				return "", fmt.Errorf("no merkle root for node %s", node)
+		for port := 8080; port <= 8089; port++ {
+			fullAddr := fmt.Sprintf("%s:%d", host, port)
+			cli := serverClients[fullAddr]
+			if cli == nil {
+				continue
 			}
-			return "", nil
-		})
-		if err != nil {
-			fmt.Printf("启动异步会话失败 %s: %v\n", addr, err)
-			continue
-		}
-		sessions[addr] = sess
-		sess.SetInFlightLimit(2048)
+			// trustedRootLookup uses hrm cache first
+			sess, err := cli.StartAsyncQueryWithWorkers(1024, workerCount, verify, func(node string) (string, error) {
+				if verify {
+					if v, ok := hrm.GetMerkleRootHash(node); ok {
+						if len(v) >= 2 && (v[0:2] == "0x" || v[0:2] == "0X") {
+							return v[2:], nil
+						}
+						return v, nil
+					}
+					return "", fmt.Errorf("no merkle root for node %s", node)
+				}
+				return "", nil
+			})
+			if err != nil {
+				fmt.Printf("启动异步会话失败 %s: %v\n", fullAddr, err)
+				continue
+			}
+			sessions[fullAddr] = sess
+			sess.SetInFlightLimit(2048)
 
-		// diagnostic: print that session was created
-		fmt.Printf("[diag] session created for addr=%s workers=%d\n", addr, workerCount)
-		recvWG.Add(1)
-		go func(s *network.AsyncQuerySession, ringID int, serverAddr string) {
-			defer recvWG.Done()
-			for res := range s.Results() {
-				if res.Err == nil && len(res.Data) > 0 {
-					if outName, ok := hashToName[res.ReturnedHash]; ok {
-						filePath := filepath.Join(receiveDir, outName)
-						if err := os.WriteFile(filePath, res.Data, 0644); err != nil {
-							fmt.Printf("[写入失败] ring=%d server=%s node=%s hash=%d 文件=%s err=%v\n", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName, err)
-							if transitionFromPending(res.RequestHash, stateFailed) {
+			// diagnostic: print that session was created
+			fmt.Printf("[diag] session created for addr=%s workers=%d\n", fullAddr, workerCount)
+			recvWG.Add(1)
+			go func(s *network.AsyncQuerySession, ringID int, serverAddr string) {
+				defer recvWG.Done()
+				for res := range s.Results() {
+					if res.Err == nil && len(res.Data) > 0 {
+						if outName, ok := hashToName[res.ReturnedHash]; ok {
+							filePath := filepath.Join(receiveDir, outName)
+							if err := os.WriteFile(filePath, res.Data, 0644); err != nil {
+								fmt.Printf("[写入失败] ring=%d server=%s node=%s hash=%d 文件=%s err=%v\n", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName, err)
+								if transitionFromPending(res.RequestHash, stateFailed) {
+									atomic.AddInt64(&receivedCount, 1)
+								}
+								select {
+								case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:
+								case <-doneCh:
+								default:
+									fmt.Printf("[警告] 写入失败回退通道已满，跳过回退 node=%s hash=%d\n", res.NodeName, res.RequestHash)
+								}
+								continue
+							}
+							if ensureCounted(res.RequestHash, stateSuccess) {
 								atomic.AddInt64(&receivedCount, 1)
 							}
-							select {
-							case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:
-							case <-doneCh:
-							default:
-								fmt.Printf("[警告] 写入失败回退通道已满，跳过回退 node=%s hash=%d\n", res.NodeName, res.RequestHash)
+							// 达到7500个成功写入时，输出吞吐与时间
+							atomic.AddInt64(&totalBytes, int64(len(res.Data)))
+							if cur := atomic.AddInt64(&successWrites, 1); cur == 7900 {
+								if atomic.CompareAndSwapInt32(&milestonePrinted, 0, 1) {
+									elapsed := time.Since(startTime)
+									mb := float64(atomic.LoadInt64(&totalBytes)) / (1024 * 1024)
+									rate := 0.0
+									if elapsed.Seconds() > 0 {
+										rate = mb / elapsed.Seconds()
+									}
+									fmt.Printf("[里程碑] 成功写入7500个文件: 耗时=%v 吞吐率=%.2f MB/s (累计=%.2f MB)\n", elapsed, rate, mb)
+								}
 							}
+							//fmt.Printf("[成功] ring=%d server=%s node=%s hash=%d 文件=%s\n", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName)
 							continue
 						}
-						if ensureCounted(res.RequestHash, stateSuccess) {
-							atomic.AddInt64(&receivedCount, 1)
-						}
-						// 达到7500个成功写入时，输出吞吐与时间
-						atomic.AddInt64(&totalBytes, int64(len(res.Data)))
-						if cur := atomic.AddInt64(&successWrites, 1); cur == 7900 {
-							if atomic.CompareAndSwapInt32(&milestonePrinted, 0, 1) {
-								elapsed := time.Since(startTime)
-								mb := float64(atomic.LoadInt64(&totalBytes)) / (1024 * 1024)
-								rate := 0.0
-								if elapsed.Seconds() > 0 {
-									rate = mb / elapsed.Seconds()
-								}
-								fmt.Printf("[里程碑] 成功写入7500个文件: 耗时=%v 吞吐率=%.2f MB/s (累计=%.2f MB)\n", elapsed, rate, mb)
-							}
-						}
-						//fmt.Printf("[成功] ring=%d server=%s node=%s hash=%d 文件=%s\n", ringID, serverAddr, res.NodeName, res.ReturnedHash, outName)
-						continue
+					}
+					if ensureCounted(res.RequestHash, stateFailed) {
+						atomic.AddInt64(&receivedCount, 1)
+					}
+					if res.Err != nil {
+						//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d err=%v -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash, res.Err)
+					} else if len(res.Data) == 0 {
+						//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未命中 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
+					} else {
+						//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未匹配文件名 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
+					}
+					select {
+					case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:
+					case <-doneCh:
+					default:
+						fmt.Printf("[警告] 回退通道已满，跳过回退 node=%s hash=%d\n", res.NodeName, res.RequestHash)
 					}
 				}
-				if ensureCounted(res.RequestHash, stateFailed) {
-					atomic.AddInt64(&receivedCount, 1)
-				}
-				if res.Err != nil {
-					//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d err=%v -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash, res.Err)
-				} else if len(res.Data) == 0 {
-					//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未命中 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
-				} else {
-					//fmt.Printf("[失败] ring=%d server=%s node=%s hash=%d 未匹配文件名 -> 回退中心\n", ringID, serverAddr, res.NodeName, res.RequestHash)
-				}
-				select {
-				case fallbackCh <- fallbackTask{NodeName: res.NodeName, FileHash: res.RequestHash}:
-				case <-doneCh:
-				default:
-					fmt.Printf("[警告] 回退通道已满，跳过回退 node=%s hash=%d\n", res.NodeName, res.RequestHash)
-				}
-			}
-		}(sess, ring, addr)
+			}(sess, ring, fullAddr)
+		}
 	}
 
 	queryPipeline := pipeline.NewClientPipeline(
@@ -269,22 +273,9 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 				if len(group) == 0 {
 					continue
 				}
-				serverAddr, ok := ringToServer[ring]
+				host, ok := ringToServer[ring]
 				if !ok {
 					fmt.Printf("[流水线] ring%d 没有对应的服务器地址，跳过该组\n", ring)
-					for _, t := range group {
-						if set := setPendingIfAbsent(t.FileHash); set {
-							atomic.AddInt64(&expectedCount, 1)
-						}
-						if ensureCounted(t.FileHash, stateFailed) {
-							atomic.AddInt64(&receivedCount, 1)
-						}
-					}
-					continue
-				}
-				sess, ok := sessions[serverAddr]
-				if !ok || sess == nil {
-					fmt.Printf("[流水线] 未找到服务器 %s 的异步会话，跳过该组\n", serverAddr)
 					for _, t := range group {
 						if set := setPendingIfAbsent(t.FileHash); set {
 							atomic.AddInt64(&expectedCount, 1)
@@ -299,13 +290,31 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 					if set := setPendingIfAbsent(t.FileHash); set {
 						atomic.AddInt64(&expectedCount, 1)
 					}
+					// pick connection by nodeId and ring -> port 8080-8089
+					var nodeId int
+					fmt.Sscanf(t.Node, "node%d", &nodeId)
+					port := 8080 + (nodeId-ring)/4
+					if port < 8080 {
+						port = 8080
+					} else if port > 8089 {
+						port = 8089
+					}
+					fullAddr := host + ":" + strconv.Itoa(port)
+					sess, ok := sessions[fullAddr]
+					if !ok || sess == nil {
+						fmt.Printf("[流水线] 未找到服务器 %s 的异步会话，跳过该请求 node=%s hash=%d\n", fullAddr, t.Node, t.FileHash)
+						if ensureCounted(t.FileHash, stateFailed) {
+							atomic.AddInt64(&receivedCount, 1)
+						}
+						continue
+					}
 					sizeHint := uint32(0)
 					if t.Size > 0 {
 						sizeHint = uint32(t.Size)
 					}
 					if !sess.TryEnqueueWithSize(t.Node, t.FileHash, sizeHint) {
 						inF, p, qLen, lim := sess.Metrics()
-						fmt.Printf("[投递-回退] server=%s node=%s hash=%d 原因=sendCh满/限流 inFlight=%d pending=%d q=%d limit=%d\n", serverAddr, t.Node, t.FileHash, inF, p, qLen, lim)
+						fmt.Printf("[投递-回退] server=%s node=%s hash=%d 原因=sendCh满/限流 inFlight=%d pending=%d q=%d limit=%d\n", fullAddr, t.Node, t.FileHash, inF, p, qLen, lim)
 						select {
 						case fallbackCh <- fallbackTask{NodeName: t.Node, FileHash: t.FileHash}:
 						case <-doneCh:
@@ -336,7 +345,7 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 	queryCount := 0
 	fmt.Println("开始流水线查询文件...")
 	for _, file := range files {
-		if queryCount >= 8000 || file.IsDir() {
+		if queryCount >= 50 || file.IsDir() {
 			continue
 		}
 		queryPipeline.PushWorkload(file.Name(), nil)
@@ -436,13 +445,16 @@ func RunPipelineMode(hrm *consistent.HashRingManager, serverClients map[string]*
 			}
 
 			for ring := 0; ring <= 3; ring++ {
-				addr, ok := ringToServer[ring]
+				host, ok := ringToServer[ring]
 				if !ok {
 					continue
 				}
-				if s, ok := sessions[addr]; ok && s != nil {
-					inF, p, qLen, lim := s.Metrics()
-					fmt.Printf("[进度-服务器] ring=%d addr=%s inFlight=%d pending=%d q=%d limit=%d\n", ring, addr, inF, p, qLen, lim)
+				for port := 8080; port <= 8089; port++ {
+					fullAddr := fmt.Sprintf("%s:%d", host, port)
+					if s, ok := sessions[fullAddr]; ok && s != nil {
+						inF, p, qLen, lim := s.Metrics()
+						fmt.Printf("[进度-服务器] ring=%d addr=%s inFlight=%d pending=%d q=%d limit=%d\n", ring, fullAddr, inF, p, qLen, lim)
+					}
 				}
 			}
 

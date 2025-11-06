@@ -381,11 +381,6 @@ func (p *Pipeline) readStage() {
 				if err != nil {
 					log.Printf("Failed to read file %s: %v", request.FileName, err)
 				}
-			} else {
-				err = p.simulateReadOperation(request)
-				if err == nil {
-					responseData = []byte(fmt.Sprintf("data_for_%s", request.FileName))
-				}
 			}
 
 			response := &DownloadResponse{
@@ -457,101 +452,6 @@ func (p *Pipeline) batchFlusher() {
 }
 
 // ==================== 辅助方法 ====================
-
-// 发送批量数据到客户端 - 按照新协议格式
-// func (p *Pipeline) sendBatchData(batch *BatchPacket) {
-// 	if p.ClientConn == nil {
-// 		log.Printf("No client connection available, cannot send batch")
-// 		return
-// 	}
-
-// 	// 筛选成功的响应
-// 	successResponses := make([]*DownloadResponse, 0, len(batch.Responses))
-// 	for _, response := range batch.Responses {
-// 		if response.Error != nil {
-// 			log.Printf("Skipping failed file %s: %v", response.Request.FileName, response.Error)
-// 			continue
-// 		}
-// 		successResponses = append(successResponses, response)
-// 	}
-
-// 	if len(successResponses) == 0 {
-// 		log.Printf("No successful files to send in this batch")
-// 		return
-// 	}
-
-// 	log.Printf("Preparing to send %d files, total data size: %d bytes",
-// 		len(successResponses), batch.TotalSize)
-
-// 	// 创建缓冲区
-// 	buffer := make([]byte, batch.TotalSize)
-// 	offset := 0
-
-// 	// 写入每个文件的数据和证明
-// 	for _, response := range successResponses {
-// 		// 写入文件哈希 (8字节)
-// 		binary.BigEndian.PutUint64(buffer[offset:offset+8], response.Request.FileHash)
-// 		offset += 8
-
-// 		// 写入是否找到数据 (1字节) - 总是1，因为我们已经过滤了失败的
-// 		buffer[offset] = 1
-// 		offset += 1
-
-// 		// 写入文件长度 (4字节)
-// 		binary.BigEndian.PutUint32(buffer[offset:offset+4], uint32(len(response.Data)))
-// 		offset += 4
-
-// 		// 写入文件内容
-// 		copy(buffer[offset:offset+len(response.Data)], response.Data)
-// 		offset += len(response.Data)
-
-// 		// 写入是否有证明 (1字节)
-// 		if response.HasProof {
-// 			buffer[offset] = 1
-// 			offset += 1
-
-// 			// 写入Merkle Path长度 (2字节)
-// 			pathLength := uint16(len(response.MerklePath))
-// 			binary.BigEndian.PutUint16(buffer[offset:offset+2], pathLength)
-// 			offset += 2
-
-// 			// 写入Merkle Path数据 (每个哈希32字节)
-// 			for _, pathHash := range response.MerklePath {
-// 				copy(buffer[offset:offset+32], pathHash)
-// 				offset += 32
-// 			}
-
-// 			// 写入Indices数组 (每个1字节)
-// 			for _, index := range response.Indices {
-// 				buffer[offset] = byte(index)
-// 				offset += 1
-// 			}
-// 		} else {
-// 			buffer[offset] = 0
-// 			offset += 1
-// 		}
-
-// 		log.Printf("Added file to batch: %s, size: %d bytes, hash: %d, hasProof: %v",
-// 			response.Request.FileName, len(response.Data), response.Request.FileHash, response.HasProof)
-// 	}
-
-// 	// 验证缓冲区写入正确
-// 	if offset != batch.TotalSize {
-// 		log.Printf("Warning: buffer size mismatch, expected %d, got %d", batch.TotalSize, offset)
-// 	}
-
-// 	// 一次性发送所有数据
-// 	startTime := time.Now()
-
-// 	if err := writeAll(p.ClientConn, buffer); err != nil {
-// 		log.Printf("Failed to send batch data: %v", err)
-// 		return
-// 	}
-
-// 	duration := time.Since(startTime)
-// 	log.Printf("Batch sent successfully: %d files, %d bytes, took %v",
-// 		len(successResponses), batch.TotalSize, duration)
-// }
 
 func (p *Pipeline) sendBatchData(batch *BatchPacket) {
 	if p.ClientConn == nil {
@@ -681,41 +581,4 @@ func writeAll(conn net.Conn, data []byte) error {
 		totalWritten += n
 	}
 	return nil
-}
-
-// 模拟读取操作
-func (p *Pipeline) simulateReadOperation(request *DownloadRequest) error {
-	time.Sleep(10 * time.Millisecond)
-	log.Printf("Simulated read operation for: %s", request.FileName)
-	return nil
-}
-
-// ==================== 状态和工具方法 ====================
-
-// 获取流水线状态
-func (p *Pipeline) GetStats() map[string]interface{} {
-	return map[string]interface{}{
-		"status":           p.status.String(),
-		"is_running":       p.IsRunning(),
-		"receive_queue":    len(p.ReceiveQueue),
-		"read_queue":       len(p.ReadQueue),
-		"batch_size_bytes": p.BatchCache.Size(),
-		"batch_file_count": p.BatchCache.FileCount(),
-		"batch_max_size":   p.BatchCache.maxBatchSize,
-	}
-}
-
-// 强制刷新批量缓存
-func (p *Pipeline) FlushBatch() {
-	if batch := p.BatchCache.Flush(); batch != nil {
-		p.sendBatchData(batch)
-		log.Printf("Manually flushed batch with %d responses, total %d bytes",
-			len(batch.Responses), batch.TotalSize)
-	}
-}
-
-// 设置最大批量大小
-func (p *Pipeline) SetMaxBatchSize(size int) {
-	p.BatchCache.maxBatchSize = size
-	log.Printf("Max batch size set to %d bytes", size)
 }

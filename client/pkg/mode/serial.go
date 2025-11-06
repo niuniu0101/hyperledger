@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/hyperledger/client/pkg/network"
 	"github.com/hyperledger/consistent"
@@ -63,7 +64,7 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 	}
 
 	for _, file := range files {
-		if queryCount >= 10000 || file.IsDir() {
+		if queryCount >= 1000 || file.IsDir() {
 			continue
 		}
 
@@ -73,10 +74,13 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		}
 		hash := sha256.Sum256([]byte(fileName))
 		fileHash := binary.BigEndian.Uint64(hash[:8])
-		ring := int(fileHash % 4)
-		ringID := fmt.Sprintf("ring%d", ring)
+		ringId := int(fileHash % 4)
+		ringID := fmt.Sprintf("ring%d", ringId)
 
-		nodeName := hrm.LocateKey(ringID, fileName)
+		nodeName := hrm.LocateKey(ringID, fileName) //找到对应的节点名
+		var nodeId int
+		fmt.Sscanf(nodeName, "node%d", &nodeId)
+		port := 8080 + (nodeId-ringId)/4
 
 		if nodeName == "" {
 			logMsg := fmt.Sprintf("未找到文件 %s 的归属节点，跳过", fileName)
@@ -86,13 +90,11 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 			continue
 		}
 
-		serverAddr, ok := ringToServer[ring]
-		if !ok {
-			serverAddr = centerServer
-		}
-		queryClient, exists := serverClients[serverAddr]
+		serverAddr := ringToServer[ringId]
+		serverFullAddr := serverAddr + ":" + strconv.Itoa(port)
+		queryClient, exists := serverClients[serverFullAddr]
 		if !exists || queryClient == nil {
-			logMsg := fmt.Sprintf("未找到服务器 %s 的专属连接，跳过: %s", serverAddr, file.Name())
+			logMsg := fmt.Sprintf("未找到服务器 %s 的专属连接，跳过: %s", serverFullAddr, file.Name())
 			fmt.Println(logMsg)
 			failCount++
 			queryCount++
@@ -102,7 +104,7 @@ func RunSerialMode(hrm *consistent.HashRingManager, centerClient *network.TCPCli
 		returnedHash, data, err := queryClient.QueryFile(nodeName, fileHash, adapter, verify)
 		if err != nil || len(data) < 1 || (len(data) >= 5 && string(data[:5]) == "ERROR") {
 			if err != nil {
-				//fmt.Printf("从 %s 查询失败: %v，回退中心\n", serverAddr, err)
+				fmt.Printf("从 %s 查询失败: %v，回退中心\n", serverFullAddr, err)
 			}
 			returnedHash, data, err = centerClient.QueryFile(nodeName, fileHash, adapter, verify)
 			if err != nil {

@@ -9,9 +9,16 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cbergoon/merkletree"
+	"github.com/hyperledger/client/pkg/fabric"
 	"github.com/hyperledger/storage/chunk"
 	"github.com/hyperledger/storage/pipeline"
 )
@@ -22,6 +29,17 @@ var (
 	cm            *chunk.ChunkManager
 	nodeTrees     map[string]*merkletree.MerkleTree // 每个节点的默克尔树
 	pipelineMgr   *pipeline.Pipeline
+	fabricClient  *fabric.FabricClient
+
+	// 按节点防抖触发上链
+	debounceInterval time.Duration
+	nodeTimers       map[string]*time.Timer
+	mu               sync.Mutex
+
+	pendingMerkleRoots map[string]bool // 只存节点名、不记录值
+	pendingMutex       sync.Mutex
+	batchTicker        *time.Ticker
+	batchInterval      time.Duration = 60 * time.Second // 可通过env调整
 )
 
 const (
@@ -48,9 +66,9 @@ func (f *FileContent) CalculateHash() ([]byte, error) {
 		return f.hash, nil
 	}
 
-	// 计算文件内容的SHA256哈希
+	// 只用内容，不加文件名
 	hash := sha256.New()
-	hash.Write([]byte(f.FileName)) // 包含文件名在哈希计算中
+	// hash.Write([]byte(f.FileName)) // 不再拼接文件名
 	hash.Write(f.Data)
 	f.hash = hash.Sum(nil)
 
@@ -175,50 +193,6 @@ func sendErrorMessage(conn net.Conn, message string) {
 	response := []byte("ERROR: " + message)
 	conn.Write(response)
 }
-
-// 处理文件上传
-// func handleUpload(conn net.Conn, data []byte) {
-// 	if len(data) < 8+16+4 {
-// 		log.Printf("Upload message too short")
-// 		sendErrorMessage(conn, "Message too short")
-// 		return
-// 	}
-
-// 	// 解析上传数据
-// 	fileHash := binary.BigEndian.Uint64(data[0:8])
-// 	fileNameBytes := data[8:24]
-// 	fileName := string(bytes.TrimRight(fileNameBytes, "\x00"))
-// 	fileLength := binary.BigEndian.Uint32(data[24:28])
-
-// 	if uint32(len(data[28:])) < fileLength {
-// 		log.Printf("File content incomplete")
-// 		sendErrorMessage(conn, "File content incomplete")
-// 		return
-// 	}
-
-// 	fileContent := data[28 : 28+fileLength]
-
-// 	// 从文件名提取节点名 (假设文件名格式为 "nodeX_filename")
-// 	nodeName := extractNodeName(fileName)
-// 	if nodeName == "" {
-// 		nodeName = "node0" // 默认节点
-// 	}
-
-// 	// 同步写入文件到块存储
-// 	if err := cm.WriteObject(nodeName, fileName, fileContent); err != nil {
-// 		log.Printf("Error writing object to chunk: %v", err)
-// 		sendErrorMessage(conn, err.Error())
-// 		return
-// 	}
-
-// 	// 更新哈希映射
-// 	HashStringMap[fileHash] = fileName
-
-// 	// 更新节点的默克尔树
-// 	if err := updateNodeMerkleTree(nodeName, fileName, fileContent); err != nil {
-// 		log.Printf("Error updating merkle tree for node %s: %v", nodeName, err)
-// 	}
-// }
 
 // 处理文件上传
 func handleUpload(conn net.Conn, data []byte) {
@@ -466,38 +440,24 @@ func updateNodeMerkleTree(nodeName, fileName string, content []byte) error {
 	// 清除缓存，下次访问时重新构建
 	delete(nodeTrees, nodeName)
 	log.Printf("Updated merkle tree cache for node %s", nodeName)
+
+	// 启动/重置该节点的防抖定时器，到期后再触发上链
+	if fabricClient != nil {
+		mu.Lock()
+		if t, ok := nodeTimers[nodeName]; ok {
+			if t.Stop() {
+				// 尽量清理旧定时器回调
+			}
+		}
+		timer := time.AfterFunc(debounceInterval, func() {
+			processNodeMerkleUpdate(nodeName)
+		})
+		nodeTimers[nodeName] = timer
+		mu.Unlock()
+	}
 	return nil
 }
 
-// // 生成默克尔树证明
-// func generateMerkleProof(nodeName, fileName string, content []byte) ([][]byte, []int64, error) {
-// 	tree, err := getOrCreateMerkleTree(nodeName)
-// 	if err != nil {
-// 		return nil, nil, fmt.Errorf("failed to get merkle tree: %v", err)
-// 	}
-
-// 	// 创建内容对象
-// 	fileContent := NewFileContent(fileName, content)
-
-// 	// 生成证明 - GetMerklePath 返回3个值
-// 	proof, indices, err := tree.GetMerklePath(fileContent)
-// 	if err != nil {
-// 		return nil, nil, fmt.Errorf("failed to generate merkle path: %v", err)
-// 	}
-
-// 	// 提取路径哈希
-// 	var merklePath [][]byte
-// 	for _, p := range proof {
-// 		merklePath = append(merklePath, p)
-// 	}
-
-// 	log.Printf("Generated merkle proof for %s: %d path elements, %d indices",
-// 		fileName, len(merklePath), len(indices))
-
-// 	return merklePath, indices, nil
-// }
-
-// 生成默克尔树证明
 func generateMerkleProof(nodeName, fileName string, content []byte) ([][]byte, []int64, error) {
 	tree, err := getOrCreateMerkleTree(nodeName)
 	if err != nil {
@@ -519,43 +479,46 @@ func generateMerkleProof(nodeName, fileName string, content []byte) ([][]byte, [
 		merklePath = append(merklePath, p)
 	}
 
-	log.Printf("Generated merkle proof for %s: %d path elements, %d indices",
-		fileName, len(merklePath), len(indices))
+	log.Printf("[MERKLE-DEBUG] ---- generateMerkleProof ----")
+	log.Printf("[MERKLE-DEBUG] fileName: %s", fileName)
 
+	// leaf hash算法要与客户端和树完全一致
+	leafHasher := sha256.New()
+	// leafHasher.Write([]byte(fileName))
+	leafHasher.Write(content)
+	leafHash := leafHasher.Sum(nil)
+
+	log.Printf("[MERKLE-DEBUG] leafHash: %x", leafHash)
+
+	for i, ph := range merklePath {
+		log.Printf("[MERKLE-DEBUG] path[%d]: %x", i, ph)
+	}
+	log.Printf("[MERKLE-DEBUG] indices: %v", indices)
+
+	// 手动计算 expected root
+	currentHash := leafHash
+	for i, siblingHash := range merklePath {
+		direction := indices[i]
+		var combinedHash []byte
+		if direction == 1 {
+			combinedHash = append(currentHash, siblingHash...)
+		} else {
+			combinedHash = append(siblingHash, currentHash...)
+		}
+		hasher := sha256.New()
+		hasher.Write(combinedHash)
+		currentHash = hasher.Sum(nil)
+		log.Printf("[MERKLE-DEBUG] after level %d: %x", i, currentHash)
+	}
+	expectedRoot := tree.MerkleRoot()
+	log.Printf("[MERKLE-DEBUG] manually calculated root: %x", currentHash)
+	log.Printf("[MERKLE-DEBUG] merkleTree root:         %x", expectedRoot)
+	log.Printf("[MERKLE-DEBUG] compare: %v", bytes.Equal(currentHash, expectedRoot))
+
+	log.Printf("Generated merkle proof for %s: %d path elements, %d indices", fileName, len(merklePath), len(indices))
 	return merklePath, indices, nil
 }
 
-// // 获取或创建节点的默克尔树
-// func getOrCreateMerkleTree(nodeName string) (*merkletree.MerkleTree, error) {
-// 	if tree, exists := nodeTrees[nodeName]; exists {
-// 		return tree, nil
-// 	}
-
-// 	// 从存储中构建默克尔树
-// 	contents, err := buildMerkleContentsFromStorage(nodeName)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	// 如果没有文件，创建一个空的默克尔树
-// 	if len(contents) == 0 {
-// 		contents = []merkletree.Content{NewFileContent("empty", []byte(""))}
-// 	}
-
-// 	tree, err := merkletree.NewTree(contents)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	nodeTrees[nodeName] = tree
-
-// 	// 计算根哈希用于验证
-// 	rootHash := tree.MerkleRoot()
-// 	log.Printf("Built merkle tree for node %s with root: %s", nodeName, hex.EncodeToString(rootHash))
-
-//		return tree, nil
-//	}
-//
 // 获取或创建节点的默克尔树 - 优化版本
 func getOrCreateMerkleTree(nodeName string) (*merkletree.MerkleTree, error) {
 	if tree, exists := nodeTrees[nodeName]; exists {
@@ -588,68 +551,163 @@ func getOrCreateMerkleTree(nodeName string) (*merkletree.MerkleTree, error) {
 	return tree, nil
 }
 
-// 从存储构建默克尔树内容
-// func buildMerkleContentsFromStorage(nodeName string) ([]merkletree.Content, error) {
-// 	var contents []merkletree.Content
-
-// 	// 读取节点目录下的所有文件
-// 	nodeDir := filepath.Join("server", nodeName)
-
-// 	// 检查节点目录是否存在
-// 	if _, err := os.Stat(nodeDir); os.IsNotExist(err) {
-// 		return contents, nil
-// 	}
-
-// 	// 读取目录下的所有文件
-// 	files, err := os.ReadDir(nodeDir)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to read node directory: %v", err)
-// 	}
-
-// 	for _, file := range files {
-// 		if !file.IsDir() {
-// 			fileName := file.Name()
-// 			filePath := filepath.Join(nodeDir, fileName)
-
-// 			// 读取文件内容
-// 			content, err := os.ReadFile(filePath)
-// 			if err != nil {
-// 				log.Printf("Warning: failed to read file %s: %v", filePath, err)
-// 				continue
-// 			}
-
-// 			// 创建Content对象
-// 			fileContent := NewFileContent(fileName, content)
-// 			contents = append(contents, fileContent)
-
-// 			log.Printf("Added file to merkle tree: %s (size: %d bytes)", fileName, len(content))
-// 		}
-// 	}
-
-// 	log.Printf("Built merkle contents for node %s: %d files", nodeName, len(contents))
-// 	return contents, nil
-// }
-
 // 从存储构建默克尔树内容 - 修改版本：使用chunk中的小文件作为叶子节点
 func buildMerkleContentsFromStorage(nodeName string) ([]merkletree.Content, error) {
 	var contents []merkletree.Content
-
 	// 从ChunkManager获取该节点的所有对象
 	objects, err := cm.GetNodeObjects(nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get node objects: %v", err)
 	}
-
-	for objectKey, objectData := range objects {
-		// 创建Content对象，使用对象key作为文件名，对象数据作为内容
+	var keys []string
+	for k := range objects {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, objectKey := range keys {
+		objectData := objects[objectKey]
 		fileContent := NewFileContent(objectKey, objectData)
 		contents = append(contents, fileContent)
-
 		log.Printf("Added object to merkle tree: %s (size: %d bytes)", objectKey, len(objectData))
 	}
-
 	log.Printf("Built merkle contents for node %s: %d objects", nodeName, len(contents))
 	return contents, nil
+}
+
+// 从磁盘读取构建默克尔树内容（避免并发访问内存结构导致的竞态）
+func buildMerkleContentsFromDisk(baseDir, nodeName string) ([]merkletree.Content, error) {
+	var contents []merkletree.Content
+
+	nodeDir := filepath.Join(baseDir, nodeName)
+	if _, err := os.Stat(nodeDir); os.IsNotExist(err) {
+		return contents, nil
+	}
+
+	entries, err := os.ReadDir(nodeDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read node directory: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// 跳过非数据文件（按需：若有明显前缀/后缀可过滤）
+		filePath := filepath.Join(nodeDir, name)
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("Warning: failed to read %s: %v", filePath, err)
+			continue
+		}
+		contents = append(contents, NewFileContent(name, data))
+	}
+	return contents, nil
+}
+
+// 串行处理上链更新：去重同一节点的重复请求，按磁盘快照重建树
+// 到期触发：按节点重建并上链
+func processNodeMerkleUpdate(nodeName string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in processNodeMerkleUpdate for %s: %v", nodeName, r)
+		}
+	}()
+
+	baseDir := "server"
+	contents, err := buildMerkleContentsFromDisk(baseDir, nodeName)
+	if err != nil {
+		log.Printf("failed to build merkle contents (disk) for %s: %v", nodeName, err)
+		return
+	}
+	if len(contents) == 0 {
+		contents = []merkletree.Content{NewFileContent("empty", []byte(""))}
+	}
+	tree, err := merkletree.NewTree(contents)
+	if err != nil {
+		log.Printf("failed to build merkle tree for %s: %v", nodeName, err)
+		return
+	}
+	hex.EncodeToString(tree.MerkleRoot())
+
+	if fabricClient != nil {
+		pendingMutex.Lock()
+		pendingMerkleRoots[nodeName] = true
+		pendingMutex.Unlock()
+		log.Printf("[BATCH] node %s ready for next batch", nodeName)
+	}
+
+	// 清理该节点的定时器引用
+	mu.Lock()
+	delete(nodeTimers, nodeName)
+	mu.Unlock()
+}
+
+func computeRingID(nodeName string) string {
+	// 环境变量优先（如单机或固定映射场景）
+	if rid := os.Getenv("FABRIC_RING_ID"); rid != "" {
+		return rid
+	}
+	// nodeName 形如 "node12"
+	if strings.HasPrefix(nodeName, "node") {
+		numStr := strings.TrimPrefix(nodeName, "node")
+		if n, err := strconv.Atoi(numStr); err == nil {
+			if n >= 0 && n < 40 {
+				return fmt.Sprintf("ring%d", n%4)
+			}
+			if n >= 40 && n <= 49 {
+				return "ring4"
+			}
+			if n >= 50 && n <= 59 {
+				return "ring5"
+			}
+		}
+	}
+	// 兜底：ring1
+	return "ring1"
+}
+
+func doBatchMerkleRoots() {
+	pendingMutex.Lock()
+	var nodes []string
+	for node := range pendingMerkleRoots {
+		nodes = append(nodes, node)
+	}
+	pendingMerkleRoots = make(map[string]bool)
+	pendingMutex.Unlock()
+
+	if len(nodes) == 0 || fabricClient == nil {
+		return
+	}
+
+	var batch []fabric.BatchMerkleUpdateItem
+	for _, node := range nodes {
+		tree, err := getOrCreateMerkleTree(node)
+		if err != nil {
+			log.Printf("[BATCH] error building merkle for node %s: %v", node, err)
+			continue
+		}
+		root := hex.EncodeToString(tree.MerkleRoot())
+		ringID := computeRingID(node)
+		log.Printf("[BATCH] node %s ring %s root %s (fresh calc)", node, ringID, root)
+		batch = append(batch, fabric.BatchMerkleUpdateItem{
+			RingID: ringID, ServerName: node, MerkleRootHash: root,
+		})
+	}
+	if len(batch) > 0 {
+		log.Printf("[BATCH] uploading to chain, %d merkle roots", len(batch))
+		err := fabricClient.BatchUpdateMerkleRoots(batch)
+		if err != nil {
+			log.Printf("[BATCH] failed to update merkle roots: %v", err)
+		} else {
+			log.Printf("[BATCH] updated merkle roots for nodes: %v", func() []string {
+				names := make([]string, 0, len(batch))
+				for _, b := range batch {
+					names = append(names, b.ServerName)
+				}
+				return names
+			}())
+		}
+	}
 }
 
 // 读取处理器 - 供流水线调用
@@ -688,6 +746,28 @@ func main() {
 	// 初始化分块管理器
 	cm = chunk.NewChunkManager(baseDir)
 
+	// 初始化 Fabric 客户端（可选，依赖环境变量/命令行参数）
+	// 若初始化失败，不影响存储服务主流程，仅记录日志
+	if fc, err := fabric.InitFabricClientFromFlags(); err != nil {
+		log.Printf("Fabric client init failed: %v (Merkle root on-chain update disabled)", err)
+	} else {
+		fabricClient = fc
+		defer fabricClient.Close()
+		log.Printf("Fabric client initialized for on-chain Merkle updates")
+	}
+
+	// 读取防抖间隔（毫秒），默认 10000ms
+	if msStr := os.Getenv("MERKLE_UPDATE_DEBOUNCE_MS"); msStr != "" {
+		if v, err := strconv.Atoi(msStr); err == nil && v >= 0 {
+			debounceInterval = time.Duration(v) * time.Millisecond
+		} else {
+			debounceInterval = 10 * time.Second
+		}
+	} else {
+		debounceInterval = 10 * time.Second
+	}
+	nodeTimers = make(map[string]*time.Timer)
+
 	// 初始化下载流水线管理器
 	pipelineMgr = pipeline.NewPipeline(readHandler)
 
@@ -697,8 +777,22 @@ func main() {
 	pipelineMgr.Start()
 	defer pipelineMgr.Stop()
 
+	// 读取批量上链时间间隔（秒），默认 10 秒
+	if intervalStr := os.Getenv("MERKLE_BATCH_UPDATE_INTERVAL"); intervalStr != "" {
+		if v, err := strconv.Atoi(intervalStr); err == nil && v > 0 {
+			batchInterval = time.Duration(v) * time.Second
+		}
+	}
+	pendingMerkleRoots = make(map[string]bool)
+	batchTicker = time.NewTicker(batchInterval)
+	go func() {
+		for range batchTicker.C {
+			doBatchMerkleRoots()
+		}
+	}()
+
 	// 启动多个端口监听
-	ports := []string{"8082", "8080", "8081", "8083"}
+	ports := []string{"8080", "8081", "8082", "8083", "8084", "8085", "8086", "8087", "8088", "8089", "8090"}
 	for _, port := range ports {
 		go startServer(port)
 	}

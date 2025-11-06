@@ -13,25 +13,33 @@ import (
 	"github.com/hyperledger/client/pkg/network"
 )
 
-/*
-const centerServer = "47.251.71.236:8081"
-
-	var ringToServer = map[int]string{
-		0: "47.251.95.138:8081",
-		1: "47.251.95.138:8080",
-		2: "47.251.95.138:8082",
-		3: "47.251.95.138:8083",
-	}
-*/
-const centerServer = "10.0.0.185:8082"
+/* const centerServer = "47.251.95.138:8081"
 
 var ringToServer = map[int]string{
-	0: "localhost:8082",
-	1: "10.0.0.185:8082",
-	4: "localhost:8082",
-	5: "localhost:8082",
-	2: "10.0.0.186:8082",
-	3: "10.0.0.187:8082",
+	0: "47.251.95.138:8080",
+	1: "47.251.95.138:8081",
+	2: "47.251.95.138:8082",
+	3: "47.251.95.138:8083",
+} */
+
+/* const centerServer = "localhost:8081"
+
+var ringToServer = map[int]string{
+	0: "localhost:8080",
+	1: "localhost:8081",
+	2: "localhost:8082",
+	3: "localhost:8083",
+} */
+
+const centerServer = "10.0.0.185:8090"
+
+var ringToServer = map[int]string{
+	0: "localhost",
+	1: "10.0.0.185",
+	4: "localhost",
+	5: "localhost",
+	2: "10.0.0.186",
+	3: "10.0.0.187",
 }
 
 var usepipeline int
@@ -83,15 +91,19 @@ func main() {
 	}
 	defer fabricClient.Close()
 
-	if err := fabricClient.InitLedger(); err != nil {
-		fmt.Printf("账本初始化失败（可忽略已初始化错误）: %v\n", err)
+	if usepipeline == 0 {
+
+		if err := fabricClient.InitLedger(); err != nil {
+			fmt.Printf("上传文件时候账本初始化失败（可忽略已初始化错误）: %v\n", err)
+		}
+
+		if err := fabricClient.InitLedgerWithCustomNodes(); err != nil {
+			fmt.Printf("添加节点失败: %v\n", err)
+		}
+
 	}
 
 	displayRingStatus(fabricClient, "账本初始化后的初始状态")
-
-	if err := fabricClient.InitLedgerWithCustomNodes(); err != nil {
-		fmt.Printf("账本添加节点失败: %v\n", err)
-	}
 
 	hrm, err := buildLocalHashRing(fabricClient)
 	if err != nil {

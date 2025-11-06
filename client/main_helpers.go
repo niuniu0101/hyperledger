@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 
 	"github.com/hyperledger/client/pkg/fabric"
 	"github.com/hyperledger/client/pkg/models"
@@ -64,18 +65,14 @@ func prepareServerClients(centerClient *network.TCPClient) (map[string]*network.
 		if !ok {
 			continue
 		}
-		if _, exists := clientCache[addr]; exists {
-			continue
+		for port := 8080; port <= 8089; port++ {
+			fullAddr := addr + ":" + strconv.Itoa(port)
+			client := network.NewTCPClient(fullAddr)
+			if err := client.Connect(); err != nil {
+				return nil, fmt.Errorf("连接 ring%d 服务器(%s) 失败: %w", ring, addr, err)
+			}
+			clientCache[fullAddr] = client
 		}
-		if addr == centerServer {
-			clientCache[addr] = centerClient
-			continue
-		}
-		client := network.NewTCPClient(addr)
-		if err := client.Connect(); err != nil {
-			return nil, fmt.Errorf("连接 ring%d 服务器(%s) 失败: %w", ring, addr, err)
-		}
-		clientCache[addr] = client
 	}
 	return clientCache, nil
 }

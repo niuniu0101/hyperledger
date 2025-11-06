@@ -4,3 +4,5 @@ cd server
 ./init.sh
 cd ..
 ./storage
+
+
